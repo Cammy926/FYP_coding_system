@@ -1,0 +1,36 @@
+# Local API
+
+Base URL: `http://127.0.0.1:3001/api`. Browser requests go through the frontend's `/api` proxy. Authentication uses an HttpOnly, SameSite=Strict cookie with an eight-hour session. Session IDs are stored as SHA-256 hashes in backend memory, with no MongoDB sessions collection. Logout revokes the in-memory session. Restarting the backend invalidates all logins; saved system data remains in MongoDB.
+
+| Method | Endpoint | Access | Result |
+| --- | --- | --- | --- |
+| GET | `/health` | Public | Connectivity, database name, collection mapping, and deferred feature flags |
+| POST | `/auth/login` | Public | Accepts username/password, sets session cookie |
+| POST | `/auth/logout` | Signed in | Revokes session and clears cookie |
+| GET | `/auth/me` | Signed in | Account details without password hash |
+| GET | `/incident` | Signed in | Active disaster, or null for managers before setup |
+| POST | `/incident` | Admin / Super Admin | Creates name/layout and unit accounts |
+| DELETE | `/incident` | Super Admin | Clears disaster after `confirmation: "CLEAR"` |
+| GET | `/incident/accounts` | Admin / Super Admin | Generated account list without hashes |
+| GET | `/reports/mine` | Resident | This unit's existing report or null |
+| POST | `/reports` | Resident | Immediately saves the chosen status, before optional details |
+| PATCH | `/reports/mine` | Resident | Finalizes optional details for the signed-in unit |
+| GET | `/dashboard` | Admin / Super Admin | Disaster, reports, counts |
+| GET | `/items?q=keywords` | Signed in, active disaster | Found items, optionally filtered |
+| GET | `/items/:id` | Signed in, active disaster | Found-item details without image bytes |
+| GET | `/items/:id/photo` | Signed in, active disaster | Decoded JPEG photo |
+| POST | `/items` | Signed in, active disaster | Creates a found-item record |
+
+Setup body: `{ "name": "Local test", "buildings": 1, "floors": 20, "rooms": 8 }`. Limits: 1–8 buildings, 1–40 floors, 1–20 rooms per floor. A second setup returns 409 until Super Admin clears the first.
+
+Button press: `POST /reports` with `{ "status": "safe" }` or `{ "status": "help" }`. This immediately saves one report for the signed-in unit with blank optional fields and `detailsSubmittedAt: null`. A first save returns 201, an identical status retry returns 200 without creating another report, and choosing the other status afterward returns 409. Unit identity always comes from the authenticated account.
+
+Optional details: `PATCH /reports/mine`. For Safe, send `{ "familyPhone": "+85291234567" }` or `{}`. For Help, send `{ "situation": "Two people need assistance", "location": "Building A stairwell", "contact": "+85291234567" }` or `{}`. Every field is optional; empty or whitespace-only values save as blank. Supplied phone numbers allow 8–15 digits and optional country-code `+`, ignoring spaces, parentheses, and hyphens. The button's status and original reporting time stay unchanged. Submission sets `detailsSubmittedAt`; matching retries return 200, while later edits or status changes are rejected. Existing reports from the previous version remain completed.
+
+The dashboard counts every saved button press, even without a details submission. The admin interface displays `N/A` for blank situation, location, contact, and family contact. The browser resumes unfinished details after reload or a new login. WhatsApp sending remains disabled.
+
+Found item: `{ "photo": "data:image/jpeg;base64,...", "description": "Mickey Mouse toy", "place": "Building A lobby", "category": "Toys", "contact": "finder@example.com" }`. Categories: Toys, Documents, Electronics, Clothing, Other. Finder contact can be a phone or email. Photos must decode as a JPEG, PNG, or WebP, up to 2 MB of input bytes and 25 megapixels. The backend re-encodes a JPEG at up to 1200 × 1200, removes metadata, and stores it inside MongoDB. The frontend first resizes selected photos up to 10 MB.
+
+Keyword searching requires every input word to appear in the combined description, place, or category, ignoring case. It treats punctuation literally and does not use Atlas Search, regex supplied by the client, or AI.
+
+Errors use `{ "error": "Readable explanation" }` with 400 for invalid input, 401 for invalid/expired sessions, 403 for forbidden actions, 404 for missing items/routes, 409 for an existing setup/report or no active disaster, 413 for oversized JSON, 429 for rate limiting, and 503 for unavailable database/services. Error messages never include the database URI. A successful write response is sent only after MongoDB confirms the save.

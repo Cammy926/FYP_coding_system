@@ -1,0 +1,7 @@
+{
+  "name": "auto-safety-report-system",
+  "private": true,
+  "type": "module",
+  "scripts": { "dev": "node scripts/dev.mjs", "setup": "node scripts/setup.mjs", "test": "node --test backend/test/*.test.js", "build": "npm --prefix frontend run build" },
+  "engines": { "node": ">=22" }
+}
