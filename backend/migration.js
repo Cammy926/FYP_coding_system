@@ -6,6 +6,7 @@ const recordTypes = { users: 'user', incidents: 'incident', safety_reports: 'saf
 export function legacyStore(db, collectionName = LEGACY_COLLECTION) {
   const collection = db.collection(collectionName);
   return { collection: name => ({ find: () => ({ toArray: async () => {
+    if (!recordTypes[name]) return [];
     const records = await collection.find({ recordType: recordTypes[name] }).toArray();
     return records.map(({ recordType, recordId, ...fields }) => ({ ...fields, _id: recordId ?? fields._id.slice(fields._id.indexOf(':') + 1) }));
   } }) }) };

@@ -4,9 +4,10 @@ import cookieParser from 'cookie-parser';
 import { rateLimit } from 'express-rate-limit';
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import sharp from 'sharp';
-import { ApiError, text, phone, scale, unitName, hashPassword, verifyPassword, publicUser, mutationQueue } from './lib.js';
+import { ApiError, text, phone, unitName, hashPassword, verifyPassword, publicUser, mutationQueue } from './lib.js';
 import { deleteIncidentData } from './db.js';
 import { createSessionStore } from './sessions.js';
+import { mapProjection, incidentBlocks, pngImage, validateMap, assertSameLayout, requireMarkers } from './maps.js';
 
 const SESSION = 'safety_session';
 const digest = token => createHash('sha256').update(token).digest('hex');
@@ -16,6 +17,13 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
   const app = express();
   const mutate = mutationQueue();
   const sessions = createSessionStore();
+  const mapClients = new Set();
+  const publishMap = () => {
+    for (const client of mapClients) {
+      if (!sessions.get(client.sessionId)) { client.res.end(); continue; }
+      client.res.write('event: map\ndata: {}\n\n');
+    }
+  };
   app.disable('x-powered-by');
   app.use(helmet());
   app.use((req, res, next) => {
@@ -24,7 +32,7 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
     if (req.method !== 'GET' && req.method !== 'HEAD' && req.get('Origin') && !origins.includes(req.get('Origin'))) return next(new ApiError(403, 'Request origin is not allowed.'));
     next();
   });
-  app.use(express.json({ limit: '4mb' }));
+  app.use(express.json({ limit: '8mb' }));
   app.use((req, res, next) => {
     if (['POST', 'DELETE', 'PATCH', 'PUT'].includes(req.method) && (req.body === null || Array.isArray(req.body) || (req.body !== undefined && typeof req.body !== 'object'))) return next(new ApiError(400, 'Send a JSON object.'));
     req.body ||= {};
@@ -39,6 +47,11 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
     if (incident.status !== 'active') throw new ApiError(503, 'Disaster setup or clearing is in progress. Please wait, or restart the backend to recover an interrupted operation.');
     return incident;
   };
+  const initialized = async () => {
+    const incident = await db.collection('incidents').findOne({ _id: 'current' });
+    const map = await db.collection('disaster_maps').findOne({ _id: 'current' }, { projection: { phase: 1, incidentId: 1 } });
+    return incident?.status === 'active' && map?.phase === 'active' && map.incidentId === incident.incidentId;
+  };
   const auth = async (req, res, next) => {
     try {
       const token = req.cookies[SESSION];
@@ -46,6 +59,7 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
       if (!session) throw new ApiError(401, 'Please log in again.');
       const user = await db.collection('users').findOne({ _id: session.userId });
       if (!user) throw new ApiError(401, 'This account is no longer available.');
+      if (user.role !== 'superadmin' && !await initialized()) throw new ApiError(401, 'Please wait for Super Admin to initialize the disaster map, then sign in again.');
       if (user.role === 'user') {
         const incident = await active();
         if (incident.incidentId !== user.incidentId) throw new ApiError(401, 'Your disaster setup has been cleared.');
@@ -73,6 +87,7 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
     const token = randomBytes(32).toString('hex');
     const expiresAt = new Date(Date.now() + 8 * 60 * 60 * 1000);
     await mutate(async () => {
+      if (user.role !== 'superadmin' && !await initialized()) throw new ApiError(403, 'Only Super Admin can sign in until the disaster map is initialized.');
       if (user.role === 'user' && user.incidentId !== (await active()).incidentId) throw new ApiError(401, 'This unit account is no longer active.');
       sessions.create({ _id: digest(token), userId: user._id, ...(user.incidentId ? { incidentId: user.incidentId } : {}), expiresAt, createdAt: new Date() });
     });
@@ -88,37 +103,99 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
   app.get('/api/incident', auth, async (req, res) => {
     const incident = await db.collection('incidents').findOne({ _id: 'current' });
     if (incident && incident.status !== 'active') throw new ApiError(503, 'Setup or clearing is in progress. Please wait or restart the backend.');
-    res.json({ incident });
+    const map = incident ? await db.collection('disaster_maps').findOne({ _id: 'current', phase: 'active', incidentId: incident.incidentId }, { projection: { name: 1, blocks: 1 } }) : null;
+    res.json({ incident: map ? { ...incident, name: map.name, blocks: map.blocks } : incident });
   });
-  app.post('/api/incident', auth, role('admin', 'superadmin'), async (req, res) => {
-    const dimensions = scale(req.body);
-    const name = text(req.body.name, 'Disaster name', 100);
+  app.get('/api/map', auth, role('admin', 'superadmin'), async (req, res) => {
+    res.json({ map: await db.collection('disaster_maps').findOne({ _id: 'current' }, mapProjection) });
+  });
+  app.get('/api/map/image', auth, role('admin', 'superadmin'), async (req, res) => {
+    const map = await db.collection('disaster_maps').findOne({ _id: 'current' });
+    if (!map) throw new ApiError(404, 'Upload a disaster map first.');
+    res.type('image/png').send(Buffer.from(map.image.data, 'base64'));
+  });
+  app.get('/api/map/events', auth, role('admin', 'superadmin'), (req, res) => {
+    res.set({ 'Content-Type': 'text/event-stream', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
+    res.flushHeaders(); res.write(': connected\n\n');
+    const client = { res, sessionId: req.sessionId }; mapClients.add(client);
+    const heartbeat = setInterval(() => {
+      if (!sessions.get(req.sessionId)) return res.end();
+      res.write(': keepalive\n\n');
+    }, 20000);
+    req.on('close', () => { clearInterval(heartbeat); mapClients.delete(client); });
+  });
+  app.post('/api/map', auth, role('superadmin'), async (req, res) => {
+    const image = await pngImage(req.body.image);
+    const map = await mutate(async () => {
+      if (!sessions.get(req.sessionId)) throw new ApiError(401, 'Please log in again.');
+      const existing = await db.collection('disaster_maps').findOne({ _id: 'current' }, mapProjection);
+      if (existing) {
+        if (req.body.revision !== existing.revision) throw new ApiError(409, 'The map changed in another window. Reload the saved map.');
+        const result = await db.collection('disaster_maps').updateOne({ _id: 'current', revision: existing.revision }, { $set: { image, imageId: randomUUID(), updatedAt: new Date() }, $inc: { revision: 1 } });
+        if (result.matchedCount !== 1) throw new ApiError(409, 'The map changed. Reload the saved map.');
+      } else {
+        const incident = await db.collection('incidents').findOne({ _id: 'current' });
+        await db.collection('disaster_maps').insertOne({ _id: 'current', phase: 'draft', incidentId: incident?.incidentId || null, image, imageId: randomUUID(), name: incident?.name || 'Disaster area', blocks: incident ? incidentBlocks(incident) : [], annotations: [], revision: 1, createdAt: new Date(), updatedAt: new Date(), createdBy: req.user.username });
+      }
+      return db.collection('disaster_maps').findOne({ _id: 'current' }, mapProjection);
+    });
+    publishMap();res.status(201).json({ map });
+  });
+  app.patch('/api/map', auth, role('superadmin'), async (req, res) => {
+    const fields = validateMap(req.body);
+    const map = await mutate(async () => {
+      if (!sessions.get(req.sessionId)) throw new ApiError(401, 'Please log in again.');
+      const existing = await db.collection('disaster_maps').findOne({ _id: 'current' }, mapProjection);
+      if (!existing) throw new ApiError(409, 'Upload a disaster map first.');
+      if (req.body.revision !== existing.revision) throw new ApiError(409, 'The map changed in another window. Reload the saved map. Your local edits have not overwritten it.');
+      const incident = await db.collection('incidents').findOne({ _id: 'current' });
+      if (incident) assertSameLayout(fields.blocks, incident);
+      if (existing.phase === 'active') requireMarkers(fields);
+      const result = await db.collection('disaster_maps').updateOne({ _id: 'current', revision: existing.revision }, { $set: { ...fields, updatedAt: new Date() }, $inc: { revision: 1 } });
+      if (result.matchedCount !== 1) throw new ApiError(409, 'The map changed. Reload the saved map.');
+      return db.collection('disaster_maps').findOne({ _id: 'current' }, mapProjection);
+    });
+    publishMap();res.json({ map });
+  });
+  app.post('/api/incident', auth, role('superadmin'), async (req, res) => {
     const result = await mutate(async () => {
       if (!sessions.get(req.sessionId)) throw new ApiError(401, 'Please log in again.');
-      if (await db.collection('incidents').findOne({ _id: 'current' })) throw new ApiError(409, 'A disaster is already configured. Only Super Admin can clear it.');
-      const incident = { _id: 'current', incidentId: randomUUID(), name, ...dimensions, status: 'provisioning', createdAt: new Date(), createdBy: req.user.username };
+      const map = await db.collection('disaster_maps').findOne({ _id: 'current' }, mapProjection);
+      if (!map) throw new ApiError(400, 'Upload and annotate a PNG map first.');
+      if (map.phase !== 'draft') throw new ApiError(409, 'The map is already initialized. Use Edit map to adjust drawings.');
+      if (req.body.mapRevision !== map.revision) throw new ApiError(409, 'Wait for all map edits to save before initializing.');
+      requireMarkers(map);
+      const existing = await db.collection('incidents').findOne({ _id: 'current' });
+      if (existing) {
+        if (existing.status !== 'active') throw new ApiError(503, 'Restart the backend to recover the unfinished setup.');
+        assertSameLayout(map.blocks, existing);
+        const result = await db.collection('disaster_maps').updateOne({ _id: 'current', revision: map.revision }, { $set: { phase: 'active', incidentId: existing.incidentId, updatedAt: new Date() }, $inc: { revision: 1 } });
+        if (result.matchedCount !== 1) throw new ApiError(409, 'The map changed. Reload the saved map.');
+        return { incident: existing, count: await db.collection('users').countDocuments({ incidentId: existing.incidentId }), preserved: true };
+      }
+      const incident = { _id: 'current', incidentId: randomUUID(), name: map.name, buildings: map.blocks.length, blocks: map.blocks, floors: map.blocks[0].floors, rooms: map.blocks[0].rooms, status: 'provisioning', createdAt: new Date(), createdBy: req.user.username };
       await db.collection('incidents').insertOne(incident);
       try {
         const accounts = [];
-        for (let b = 0; b < dimensions.buildings; b++) for (let f = 1; f <= dimensions.floors; f++) for (let r = 1; r <= dimensions.rooms; r++) {
-          const username = unitName(dimensions.buildings, b, f, r);
-          accounts.push({ _id: username, username, role: 'user', incidentId: incident.incidentId, building: b, floor: f, room: r, createdAt: new Date() });
+        for (const block of map.blocks) for (let f = 1; f <= block.floors; f++) for (let r = 1; r <= block.rooms; r++) {
+          const username = unitName(map.blocks.length, block.building, f, r);
+          accounts.push({ _id: username, username, role: 'user', incidentId: incident.incidentId, building: block.building, floor: f, room: r, createdAt: new Date() });
         }
-        // Small batches bound password-hashing memory and MongoDB request size.
         for (let i = 0; i < accounts.length; i += 16) {
           const batch = accounts.slice(i, i + 16);
           await Promise.all(batch.map(async user => { user.passwordHash = await hashPassword(user.username); }));
           await db.collection('users').insertMany(batch, { ordered: true });
         }
+        const saved = await db.collection('disaster_maps').updateOne({ _id: 'current', revision: map.revision }, { $set: { phase: 'active', incidentId: incident.incidentId, updatedAt: new Date() }, $inc: { revision: 1 } });
+        if (saved.matchedCount !== 1) throw new ApiError(409, 'The map changed. Reload the saved map.');
         await db.collection('incidents').updateOne({ _id: 'current', incidentId: incident.incidentId }, { $set: { status: 'active' } });
-        return { incident: { ...incident, status: 'active' }, count: accounts.length };
+        return { incident: { ...incident, status: 'active' }, count: accounts.length, preserved: false };
       } catch (e) {
-        // If cleanup fails the provisioning marker remains for startup recovery.
-        await deleteIncidentData(db, incident);
-        throw e;
+        await db.collection('disaster_maps').updateOne({ _id: 'current', incidentId: incident.incidentId }, { $set: { phase: 'draft', incidentId: null } });
+        await deleteIncidentData(db, incident);throw e;
       }
     });
-    res.status(201).json(result);
+    publishMap();res.status(201).json(result);
   });
   app.delete('/api/incident', auth, role('superadmin'), async (req, res) => {
     if (req.body.confirmation !== 'CLEAR') throw new ApiError(400, 'Type CLEAR to confirm deletion.');
@@ -130,6 +207,7 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
       await deleteIncidentData(db, incident);
       sessions.deleteIncident(incident.incidentId);
     });
+    publishMap();
     res.json({ message: 'Disaster data, unit accounts, safety reports, and found items deleted. Manager accounts remain.' });
   });
   app.get('/api/incident/accounts', auth, role('admin', 'superadmin'), async (req, res) => {
@@ -183,10 +261,18 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
   });
   app.get('/api/dashboard', auth, role('admin', 'superadmin'), async (req, res) => {
     const incident = await active();
-    const reports = await db.collection('safety_reports').find({ incidentId: incident.incidentId }).toArray();
-    const safe = reports.filter(r => r.status === 'safe').length;
-    const help = reports.filter(r => r.status === 'help').length;
-    res.json({ incident, reports, counts: { safe, help, none: incident.buildings * incident.floors * incident.rooms - safe - help } });
+    const map = await db.collection('disaster_maps').findOne({ _id: 'current' }, mapProjection);
+    if (map?.phase !== 'active' || map.incidentId !== incident.incidentId) throw new ApiError(409, 'Initialize the disaster map first.');
+    const blocks = map.blocks;
+    let selected = null;
+    if (req.query.building !== undefined) {
+      if (typeof req.query.building !== 'string' || !/^\d+$/.test(req.query.building) || !blocks[Number(req.query.building)]) throw new ApiError(400, 'Choose a valid building block.');
+      selected = Number(req.query.building);
+    }
+    const reports = await db.collection('safety_reports').find({ incidentId: incident.incidentId, ...(selected === null ? {} : { building: selected }) }).toArray();
+    const safe = reports.filter(r => r.status === 'safe').length, help = reports.filter(r => r.status === 'help').length;
+    const total = blocks.filter(b => selected === null || b.building === selected).reduce((n, b) => n + b.floors * b.rooms, 0);
+    res.json({ incident: { ...incident, name: map.name, blocks }, reports, building: selected, counts: { safe, help, none: total - safe - help } });
   });
   app.get('/api/items', auth, async (req, res) => {
     const incident = await active();
@@ -239,7 +325,7 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
   app.use((err, req, res, next) => {
     const status = err instanceof ApiError ? err.status : err.type === 'entity.too.large' ? 413 : err.type === 'entity.parse.failed' ? 400 : 503;
     if (status === 503) console.error(`Database/service error: ${err.name}, code ${err.code || 'unknown'}`);
-    const error = err instanceof ApiError ? err.message : status === 413 ? 'Upload is too large. Choose a photo up to 2 MB.' : status === 400 ? 'Request must contain valid JSON.' : 'The database is unavailable. Nothing has been confirmed saved. Please check the backend and try again.';
+    const error = err instanceof ApiError ? err.message : status === 413 ? 'Upload is too large. Choose a PNG map up to 4 MB or a found-item photo up to 2 MB.' : status === 400 ? 'Request must contain valid JSON.' : 'The database is unavailable. Nothing has been confirmed saved. Please check the backend and try again.';
     res.status(status).json({ error });
   });
   return app;

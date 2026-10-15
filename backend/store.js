@@ -1,5 +1,5 @@
 // The API uses logical names; each maps to its own MongoDB collection.
-export const COLLECTION_NAMES = Object.freeze({ users: 'user', incidents: 'incidents', safety_reports: 'safety_reports', found_items: 'found_items' });
+export const COLLECTION_NAMES = Object.freeze({ users: 'user', incidents: 'incidents', safety_reports: 'safety_reports', found_items: 'found_items', disaster_maps: 'disaster_maps' });
 export function createStore(db) {
   return {
     databaseName: db.databaseName,

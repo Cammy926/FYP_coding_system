@@ -7,6 +7,7 @@ Server: the configured Azure Cosmos DB MongoDB endpoint. Database: `auto_safety_
 | user | _id=username, username, role, passwordHash, createdAt; residents also have incidentId, building, floor, room |
 | incidents | _id=current, incidentId UUID, name, buildings, floors, rooms, status, createdAt, createdBy |
 | safety_reports | _id=incidentId:username; incidentId, userId, username, building, floor, room, status, situation, location, contact, familyPhone, detailsSubmittedAt, notificationStatus, createdAt |
+| disaster_maps | _id=current; sanitized PNG, imageId, name, blocks, annotations, phase, incidentId, revision, createdAt, updatedAt |
 | found_items | _id UUID; incidentId, description, place, category, contact, photo JPEG data URL, createdBy, createdAt |
 
 `backend/store.js` maps the API's logical `users` group to the physical `user` collection. Other groups use the collection names shown above. Documents use ordinary application IDs without recordType or recordId wrappers. A clear operation removes the active incident's records only; manager accounts remain. Future search features can add their own collections to this database.
@@ -44,3 +45,13 @@ Records from the previous `FYP-SafetySystem` collection have been copied and ver
 The original local data files remain unchanged, with local connection settings privately saved in `backend/.env.local`. `npm run db:migrate-local` supports legacy separate local collections, legacy mixed records, and the current separate-collection format. Neither migration runs automatically during startup.
 
 Existing unrelated Azure databases and collections are untouched. The frontend/backend stay on localhost, while Azure stores the system records. The backend requires internet access and does not fall back to a second database silently.
+
+## Disaster map
+
+One current map is saved in disaster_maps. Its sanitized PNG and vector annotations occupy one bounded document. Metadata endpoints omit image bytes; the image has an authenticated endpoint. Normalized coordinates keep drawings aligned across screen sizes. Revision checks reject stale edits with 409. Manager windows receive live update events and reload the latest map; periodic refresh also recovers missed events.
+
+Each block stores a label, stable building index, floors, and units per floor. Counts and account generation sum each block independently. Renaming a map label does not change resident account IDs. Every initialized block retains a clickable marker. Drawing types are pen, rectangle, text/emoji, and block marker.
+
+New maps begin as drafts. Initialization reserves a provisioning incident, creates accounts in batches, links the map, and activates the incident. Interrupted provisioning retains the draft map and removes partial accounts. Interrupted clearing removes the map and incident data. For existing incidents, map setup links to their existing layout and preserves accounts and reports. Only Super Admin can log in until the map is active and linked. Map writes require Super Admin; admins can read and open block overviews.
+
+Building label size is independent of floor/unit layouts. Optional normalized marker w/h fields store the visible width/height with its centered x/y position. Existing markers without these fields retain their original automatic sizing. Resizing, including after initialization, uses the same autosave, revision checks, and live manager updates as other drawing edits.

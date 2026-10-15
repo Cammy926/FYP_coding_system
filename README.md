@@ -51,13 +51,16 @@ Resident accounts exist only after disaster setup. These predictable passwords f
 
 ## Try the complete flow
 
-1. Sign in as Super Admin or Admin. With no active disaster, you reach **Set the disaster scale**.
-2. Enter a disaster name and the number of buildings, floors, and rooms. The default 1 × 20 × 8 creates 160 resident accounts.
-3. The **Safety Overview** shows building tabs, floor rows, room columns, status totals, and urgent help requests. Use **Unit accounts** to download a CSV of generated accounts and their initial passwords.
-4. Log out, then sign in as a generated unit, such as `204`. The first page has two large buttons: **Safe** and **I need help**. Clicking either immediately saves the status to the admin overview. The next page asks for optional details: a family WhatsApp number for Safe; situation, current location, and contact for Help. Submit with every field blank if needed. The confirmation includes a link to call 999. If you leave after the button press, your status remains saved, and the unfinished form resumes on your return. The selected status is locked; details can be finalized once.
-5. Sign in as a responder again. The submitted unit is green or red. Select it to read the report and reporting time. Missing details display as **N/A**. While open, the overview refreshes every five seconds.
-6. Any signed-in role can open **Lost & Found**. Submit a real photo, description, place, category, and finder contact through **I Found Something**. Browse **Show all items**, search keywords, and open an item’s details.
-7. **Clear Setup** is available only to Super Admin. It asks you to type `CLEAR` and permanently deletes the active disaster’s unit accounts, safety reports, and found items. Admin and Super Admin accounts remain for the next setup.
+1. Start backend and frontend in the two VS Code terminals, then open http://localhost:5173. Before a map is initialized, only **superadmin / superadmin** can log in. Admin and resident logins remain blocked.
+2. Super Admin uploads a **PNG map up to 4 MB**. Use your own image, or **backend/test/fixtures/disaster-map.png** copied from your attachment.
+3. Select **Building block**, then click the map. Set the block label, floors, and units per floor. Repeat for each building; counts can differ. Use Pen with color/width, Boundary, and Text / emoji for annotations. Select / move repositions drawings and labels. Select a building label and drag its corner handle, or use the sidebar Block width / Block height controls, to grow or shrink its visible size. Resizing preserves floors and units and works after initialization; Delete selected removes mistakes; Undo reverses the last edit. Drawings save automatically.
+4. Wait for **All changes saved**, then select **Initialize**. Accounts use each block's own layout. For multiple blocks, account prefixes follow creation order: A-204, B-204, etc. The Unit accounts download lists account names and initial passwords.
+5. Admin and Super Admin enter the **disaster map**. Click a map label or building shortcut to see only that block's counts, help requests, floors, and units. **Back to disaster map** returns to the map.
+6. Only Super Admin has **Edit map**. Drawing changes autosave and appear in other manager windows immediately. Block names and positions can change after initialization; floor/unit counts and building count stay fixed to preserve existing accounts and reports. Clear Setup is required to create a different unit layout.
+7. For a disaster from the previous version, Super Admin uploads a map and places its existing blocks. Initialization preserves old accounts, passwords, reports, and found items. Other roles can log in once the map is initialized.
+8. Residents retain the two-button **Safe / I need help** flow. Status saves immediately before optional details; empty details show **N/A** to responders. Confirmations include **Call 999**.
+9. Lost & Found uploads, keywords, and item details remain available. WhatsApp automation and AI search are deferred.
+10. **Clear Setup** on the Super Admin map view requires typing CLEAR and removes the map and incident accounts, reports, and found items. Manager accounts remain.
 
 ## Open the data in MongoDB Compass
 
@@ -76,6 +79,7 @@ Each kind of system data has a separate collection:
 | `incidents` | Disaster layout, name, and setup state |
 | `safety_reports` | Safe/help status, contacts, situation, and reporting time |
 | `found_items` | Item details and the resized JPEG photo |
+| `disaster_maps` | PNG map, block layouts, annotations, initialization state, edit revision |
 
 The records previously stored together in `FYP-SafetySystem` have been migrated into these collections with their original application IDs and relationships. You have deleted `FYP-SafetySystem`; the application does not read, write, or recreate it. Future search features can use additional collections in this same database.
 
@@ -98,6 +102,9 @@ Open this whole folder in Visual Studio Code.
 | `frontend/src/App.vue` | All screens, forms, navigation, and calls to the API |
 | `frontend/src/style.css` | Prototype-based navy/teal design and responsive layouts |
 | `frontend/vite.config.js` | Frontend port and local API proxy |
+| `frontend/src/MapEditor.vue` | Drawing tools, per-block setup, deletion, undo, and autosave |
+| `frontend/src/FloorPlan.vue` | Responsive map with clickable building labels |
+| `backend/maps.js` | PNG, drawing, and block layout validation |
 | `backend/app.js` | Express API routes, permissions, validation, and report rules |
 | `backend/db.js` | Database connection, collection/index creation, manager seeding, and recovery |
 | `backend/store.js` | Maps API record groups to separate collections (accounts use user) |
@@ -123,7 +130,7 @@ The setup launcher uses npm when available, or the bundled pnpm on this Mac. Eac
 
 ## Verification
 
-The frontend production build, 13 API/storage/startup tests, and browser flows for the two-step safety page passed. Browser checks cover mobile and desktop, immediate button saves, admin auto-refresh, blank submissions, optional contact/location details, N/A displays, closing after one click, and resuming unfinished reports. The tests use a separate temporary MongoDB process and database, never the configured application database. They cover authentication, permissions, origin checks, duplicate setup/report requests, real photo validation, searching, persistence, logout revocation, Clear Setup, and recovery from an interrupted setup or clear. Browser checks additionally exercise the actual Vue screens.
+The frontend production build, 15 API/storage/startup tests, and browser flows for the two-step safety page passed. Browser checks cover PNG maps, unequal blocks, drawing tools, live updates, role restrictions, mobile and desktop, immediate button saves, admin auto-refresh, blank submissions, optional contact/location details, N/A displays, closing after one click, and resuming unfinished reports. The tests use a separate temporary MongoDB process and database, never the configured application database. They cover authentication, permissions, origin checks, duplicate setup/report requests, real photo validation, searching, persistence, logout revocation, Clear Setup, and recovery from an interrupted setup or clear. Browser checks additionally exercise the actual Vue screens.
 
 Run tests with `npm test` from the root, or `npm test` inside backend. Build the frontend with `npm run build` from the root. A read-only database check is available with `npm --prefix backend run db:check`.
 
@@ -149,3 +156,5 @@ A one-time migration utility is available with `npm run db:migrate-local` inside
 To migrate an older single-collection copy, stop the backend and run `npm run db:migrate-collections` inside backend. It verifies copied records, retains the source, and refuses to overwrite conflicts. This migration has already been completed for the configured Azure database.
 
 The browser test runner is **browser-test/flow.mjs**. After `npm run build` in frontend, run it with `node browser-test/flow.mjs` from the project root on this Mac. It uses the bundled Playwright runtime and Google Chrome, starts isolated temporary MongoDB data, and closes all test servers afterward. Screenshots are saved under **test-results/**. It never reads the application connection string or uses the Azure database.
+
+Map edits use revision checks to prevent overwriting changes from another editor window. The latest PNG and annotations are saved in disaster_maps; no history collection or sessions collection is created.

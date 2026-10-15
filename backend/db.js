@@ -27,11 +27,14 @@ export async function initializeDatabase(db, passwords = {}) {
   const incident = await store.collection('incidents').findOne({ _id: 'current' });
   // Recover interrupted multi-record operations before login opens: setup
   // rolls back, and an interrupted deletion finishes on the next launch.
-  if (incident && incident.status !== 'active') await deleteIncidentData(store, incident);
+  if (incident && incident.status !== 'active') {
+    if (incident.status === 'provisioning') await store.collection('disaster_maps').updateOne({ _id: 'current', incidentId: incident.incidentId }, { $set: { phase: 'draft', incidentId: null } });
+    await deleteIncidentData(store, incident);
+  }
   return store;
 }
 export async function deleteIncidentData(db, incident) {
   const query = { incidentId: incident.incidentId };
-  for (const name of ['safety_reports', 'found_items', 'users']) await db.collection(name).deleteMany(query);
+  for (const name of ['safety_reports', 'found_items', 'users', 'disaster_maps']) await db.collection(name).deleteMany(query);
   await db.collection('incidents').deleteOne({ _id: 'current', incidentId: incident.incidentId });
 }

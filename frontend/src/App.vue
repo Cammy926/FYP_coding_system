@@ -1,5 +1,7 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue';
+import FloorPlan from './FloorPlan.vue';
+import MapEditor from './MapEditor.vue';
 import { ShieldCheck, LogOut, House, Search, CircleCheck, TriangleAlert, ArrowRight, ArrowLeft, Upload, RefreshCw, Download, PackageSearch, MapPin, Phone, Check, LockKeyhole } from 'lucide-vue-next';
 
 const user = ref(null), incident = ref(null), screen = ref('login'), busy = ref(false), initializing = ref(true);
@@ -7,7 +9,9 @@ const error = ref(''), notice = ref(''), online = ref(false), updated = ref(null
 const reports = ref([]), myReport = ref(null), building = ref(0), selectedUnit = ref(null);
 const counts = reactive({ safe: 0, help: 0, none: 0 });
 const login = reactive({ username: '', password: '' });
-const setup = reactive({ name: '', buildings: 1, floors: 20, rooms: 8 });
+const dashboardReady = ref(false);
+const mapData = ref(null), editor = ref(null), mapUnsaved = ref(false), editorKey = ref(0);
+const selectedBlock = computed(() => mapData.value?.blocks?.[building.value]);
 const safety = reactive({ familyPhone: '', situation: '', location: '', contact: '' });
 const reportStep = computed(() => !myReport.value ? 'choice' : myReport.value.detailsSubmittedAt === null ? 'details' : 'complete');
 const displayDetail = value => typeof value === 'string' && value.trim() ? value : 'N/A';
@@ -15,13 +19,13 @@ const found = reactive({ photo: '', description: '', place: '', category: '', co
 const keyword = ref(''), items = ref([]), searched = ref(false), item = ref(null);
 const clearOpen = ref(false), confirmation = ref('');
 const manager = computed(() => user.value && user.value.role !== 'user');
-const total = computed(() => setup.buildings * setup.floors * setup.rooms);
+
 const lostScreen = computed(() => ['lost', 'found', 'items', 'detail'].includes(screen.value));
 const urgent = computed(() => reports.value.filter(r => r.status === 'help' && r.building === building.value).sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt)));
-const floorNumbers = computed(() => incident.value ? Array.from({ length: incident.value.floors }, (_,i) => incident.value.floors - i) : []);
+const floorNumbers = computed(() => incident.value ? Array.from({ length: selectedBlock.value?.floors || 0 }, (_,i) => selectedBlock.value.floors - i) : []);
 const reportMap = computed(() => new Map(reports.value.map(r => [`${r.building}:${r.floor}:${r.room}`, r])));
 const categories = ['Toys', 'Documents', 'Electronics', 'Clothing', 'Other'];
-let timer, polling = false;
+let timer, mapEvents, polling = false;
 const formatTime = value => value ? new Date(value).toLocaleString('en-HK', { timeZone: 'Asia/Hong_Kong', dateStyle: 'medium', timeStyle: 'short' }) : '';
 const label = (b, f, r) => `${incident.value?.buildings > 1 ? String.fromCharCode(65+b)+'-' : ''}${f}${String(r).padStart(2,'0')}`;
 const photoUrl = id => `/api/items/${encodeURIComponent(id)}/photo`;
@@ -38,6 +42,7 @@ async function api(path, options = {}) {
   return data;
 }
 function resetSession() {
+  mapEvents?.close(); mapEvents = null; mapData.value = null; mapUnsaved.value = false;
   user.value = null; incident.value = null; reports.value = []; myReport.value = null; items.value = []; item.value = null;
   login.password = ''; safety.familyPhone = ''; safety.situation = ''; safety.location = ''; safety.contact = '';
   Object.assign(found, { photo: '', description: '', place: '', category: '', contact: '' });
@@ -50,47 +55,78 @@ async function task(work) {
   catch (e) { if (e.status === 401 && user.value) resetSession(); error.value = e.message; }
   finally { busy.value = false; }
 }
+function watchMap() {
+  mapEvents?.close(); mapEvents = null;
+  if (!manager.value) return;
+  mapEvents = new EventSource('/api/map/events');
+  mapEvents.addEventListener('map', () => { if (screen.value !== 'map-editor' && !busy.value) refresh().catch(e => { if (e.status === 401) resetSession(); error.value = e.message; }); });
+}
 async function refresh() {
   const current = user.value;
   if (!current) return;
   const data = await api('/incident');
   if (user.value !== current) return;
   incident.value = data.incident;
-  if (!incident.value) { screen.value = 'setup'; items.value = []; reports.value = []; clearOpen.value = false; return; }
-  if (screen.value === 'setup') screen.value = manager.value ? 'dashboard' : 'resident';
   if (manager.value) {
-    const data = await api('/dashboard');
-    if (user.value !== current) return;
-    reports.value = data.reports; Object.assign(counts, data.counts);
+    if (screen.value === 'map-editor') return;
+    const result = await api('/map'); if (user.value !== current) return;
+    const incoming = result.map, previous = mapData.value;
+    if (!incoming || !previous || new Date(incoming.createdAt) > new Date(previous.createdAt) || (String(incoming.createdAt) === String(previous.createdAt) && incoming.revision >= previous.revision)) mapData.value = incoming;
+    if (!mapData.value || mapData.value.phase !== 'active') {
+      screen.value = mapData.value ? 'map-editor' : 'map-upload'; reports.value = []; clearOpen.value = false; return;
+    }
+    if (['map-upload','setup'].includes(screen.value)) screen.value = 'map';
+    const selected = screen.value === 'dashboard' ? building.value : null;
+    const dashboard = await api(`/dashboard${selected === null ? '' : '?building=' + selected}`);
+    if (user.value !== current || (screen.value === 'dashboard' && building.value !== selected)) return;
+    reports.value = dashboard.reports; Object.assign(counts, dashboard.counts); dashboardReady.value = true;
     if (selectedUnit.value) selectedUnit.value = { ...selectedUnit.value, report: reportMap.value.get(`${selectedUnit.value.building}:${selectedUnit.value.floor}:${selectedUnit.value.room}`) };
   } else {
-    const data = await api('/reports/mine'); if (user.value !== current) return; acceptReport(data.report);
+    const result = await api('/reports/mine'); if (user.value !== current) return; acceptReport(result.report);
   }
   updated.value = new Date();
 }
+async function uploadMap(event) {
+  const file = event.target.files?.[0]; if (!file) return;
+  await task(async () => {
+    if (file.type !== 'image/png' || file.size > 4 * 1024 * 1024) throw new Error('Choose a PNG map up to 4 MB.');
+    const image = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = () => reject(new Error('Cannot read this map.')); reader.readAsDataURL(file); });
+    const result = await api('/map', { method: 'POST', body: { image, ...(mapData.value ? { revision: mapData.value.revision } : {}) } });
+    mapData.value = result.map; editorKey.value++; screen.value = 'map-editor';
+  });
+  event.target.value = '';
+}
+async function saveMap(fields) { return (await api('/map', { method: 'PATCH', body: fields })).map; }
+async function reloadMap() {
+  await task(async () => { mapData.value = (await api('/map')).map; mapUnsaved.value = false; editorKey.value++; if (!mapData.value) screen.value = 'map-upload'; });
+}
+async function editMap() { await task(async () => { mapData.value = (await api('/map')).map; editorKey.value++; screen.value = 'map-editor'; }); }
+async function openBlock(index) { await task(async () => { building.value = index; selectedUnit.value = null; dashboardReady.value = false; screen.value = 'dashboard'; await refresh(); }); }
+async function showMap() { screen.value = 'map'; mapUnsaved.value = false; await task(refresh); }
 async function signIn() {
   await task(async () => {
     const data = await api('/auth/login', { method: 'POST', body: login });
     user.value = data.user; login.password = ''; building.value = 0;
-    screen.value = manager.value ? 'dashboard' : 'resident';
-    await refresh();
+    screen.value = manager.value ? 'map' : 'resident';
+    await refresh(); watchMap();
   });
 }
 async function signOut() {
+  if (mapUnsaved.value && editor.value && !await editor.value.flush()) return;
   await task(async () => { await api('/auth/logout', { method: 'POST' }); resetSession(); notice.value = 'You have logged out.'; });
 }
-async function configure() {
+async function configure(revision) {
   await task(async () => {
-    const data = await api('/incident', { method: 'POST', body: setup });
-    incident.value = data.incident; screen.value = 'dashboard'; building.value = 0;
-    await refresh(); notice.value = `${data.count} unit accounts created. Passwords match their account names for localhost testing.`;
+    const data = await api('/incident', { method: 'POST', body: { mapRevision: revision } });
+    incident.value = data.incident; screen.value = 'map'; mapUnsaved.value = false;
+    await refresh(); notice.value = data.preserved ? 'Disaster map initialized. Existing accounts and reports are preserved.' : `${data.count} unit accounts created. Click a block to review its safety reports.`;
   });
 }
 async function clearSetup() {
   await task(async () => {
     await api('/incident', { method: 'DELETE', body: { confirmation: confirmation.value } });
     incident.value = null; reports.value = []; items.value = []; selectedUnit.value = null; clearOpen.value = false; confirmation.value = '';
-    Object.assign(setup, { name: '', buildings: 1, floors: 20, rooms: 8 }); screen.value = 'setup'; notice.value = 'Setup cleared. You can create a new disaster.';
+    mapData.value = null; screen.value = 'map-upload'; notice.value = 'Setup cleared. Upload a new disaster map.';
   });
 }
 function acceptReport(report) {
@@ -119,7 +155,7 @@ async function submitSafetyDetails() {
   if (error.value && incident.value) await refresh().catch(() => {});
 }
 function selectUnit(floor, room) { selectedUnit.value = { building: building.value, floor, room, username: label(building.value,floor,room), report: reportMap.value.get(`${building.value}:${floor}:${room}`) }; }
-function navigate(destination) { screen.value = destination; error.value = ''; notice.value = ''; clearOpen.value = false; }
+async function navigate(destination) { if (screen.value === 'map-editor' && editor.value && !await editor.value.flush()) return; screen.value = destination; error.value = ''; notice.value = ''; clearOpen.value = false; if (destination === 'map') await task(refresh); }
 async function loadItems(search = false) {
   await task(async () => {
     if (search && !keyword.value.trim()) throw new Error('Enter a keyword to search.');
@@ -158,7 +194,7 @@ async function downloadAccounts() {
   });
 }
 onMounted(async () => {
-  try { await api('/health'); online.value = true; user.value = (await api('/auth/me')).user; screen.value = manager.value ? 'dashboard' : 'resident'; await refresh(); }
+  try { await api('/health'); online.value = true; user.value = (await api('/auth/me')).user; screen.value = manager.value ? 'map' : 'resident'; await refresh(); watchMap(); }
   catch (e) { if (e.status !== 401) error.value = e.message; }
   finally { initializing.value = false; }
   timer = setInterval(async () => {
@@ -169,7 +205,7 @@ onMounted(async () => {
     finally { polling = false; }
   }, 5000);
 });
-onUnmounted(() => clearInterval(timer));
+onUnmounted(() => { clearInterval(timer); mapEvents?.close(); });
 </script>
 
 <template>
@@ -186,20 +222,27 @@ onUnmounted(() => clearInterval(timer));
 
       <section v-else-if="screen === 'login'" class="login-layout">
         <div class="hero"><div><span class="eyebrow">Community safety platform</span><h1>Know who is safe.<br>Find who needs help.</h1><p>A clear connection between residents and responders, when every update matters.</p></div><div class="hero-flow"><span><CircleCheck :size="18"/>Report safety or request help</span><span><House :size="18"/>Review unit status by location</span><span><PackageSearch :size="18"/>Reconnect lost items with owners</span></div></div>
-        <form class="card login-form" @submit.prevent="signIn"><span class="eyebrow">Welcome back</span><h2>Sign in</h2><p>Use your responder account or the account assigned to your unit.</p><label class="field"><span>Account name</span><input v-model="login.username" required maxlength="40" autocomplete="username" placeholder="e.g. 204 or A-204" :disabled="busy"></label><label class="field"><span>Password</span><input v-model="login.password" required maxlength="200" type="password" autocomplete="current-password" placeholder="Enter your password" :disabled="busy"></label><button class="primary full" :disabled="busy">{{ busy ? 'Signing in…' : 'Sign in' }}<ArrowRight :size="18"/></button><div class="hint"><LockKeyhole :size="15"/>Local test accounts: superadmin / superadmin · admin / admin. Unit accounts become available after setup.</div></form>
+        <form class="card login-form" @submit.prevent="signIn"><span class="eyebrow">Welcome back</span><h2>Sign in</h2><p>Use your responder account or the account assigned to your unit.</p><label class="field"><span>Account name</span><input v-model="login.username" required maxlength="40" autocomplete="username" placeholder="e.g. 204 or A-204" :disabled="busy"></label><label class="field"><span>Password</span><input v-model="login.password" required maxlength="200" type="password" autocomplete="current-password" placeholder="Enter your password" :disabled="busy"></label><button class="primary full" :disabled="busy">{{ busy ? 'Signing in…' : 'Sign in' }}<ArrowRight :size="18"/></button><div class="hint"><LockKeyhole :size="15"/>Local test accounts: superadmin / superadmin · admin / admin. Only Super Admin can sign in before the disaster map is initialized.</div></form>
       </section>
 
-      <section v-else-if="screen === 'setup'" class="narrow">
-        <form class="card" @submit.prevent="configure"><span class="eyebrow">Responder workspace · Setup</span><h2>Set the disaster scale</h2><p>Configure the affected buildings. An account will be created for every unit.</p><label class="field"><span>Disaster name</span><input v-model="setup.name" required maxlength="100" placeholder="e.g. Community safety test" :disabled="busy"></label><div class="fields"><label class="field"><span>Buildings</span><input v-model.number="setup.buildings" type="number" min="1" max="8" required :disabled="busy"></label><label class="field"><span>Floors per building</span><input v-model.number="setup.floors" type="number" min="1" max="40" required :disabled="busy"></label><label class="field"><span>Rooms per floor</span><input v-model.number="setup.rooms" type="number" min="1" max="20" required :disabled="busy"></label></div><div class="setup-summary"><strong>{{ total || 0 }} units → {{ total || 0 }} accounts</strong><p>Account names and initial passwords match: {{ setup.buildings > 1 ? 'A-204 / A-204, B-204 / B-204' : '204 / 204' }}.</p></div><button class="primary full" :disabled="busy">{{ busy ? 'Creating accounts… Please wait' : 'Create disaster & unit accounts' }}<ArrowRight v-if="!busy" :size="18"/></button><p class="hint">One disaster can be active at a time. Only Super Admin can clear a setup. Large layouts take longer to generate.</p></form>
+      <section v-else-if="screen === 'map-upload' && user?.role === 'superadmin'" class="narrow">
+        <div class="card map-upload"><span class="eyebrow">Super Admin · First step</span><h2>Upload the disaster area map</h2><p>Choose a PNG map. Next, label each building and add boundaries, notes, or emoji before initializing.</p><label class="map-upload-box"><Upload :size="42"/><strong>Choose a PNG map</strong><span>Up to 4 MB · PNG only</span><input aria-label="Disaster map PNG" type="file" accept="image/png" :disabled="busy" @change="uploadMap"></label><p v-if="incident" class="hint">Your existing unit accounts and safety reports will be preserved. Place labels for their building blocks to finish map setup.</p></div>
       </section>
-
-      <section v-else-if="screen === 'dashboard' && incident">
-        <div class="page-head"><div><span class="eyebrow">Responder workspace · Safety overview</span><h2>{{ incident.name }}</h2><p>{{ incident.buildings }} building{{ incident.buildings>1?'s':'' }} · {{ incident.floors }} floors · {{ incident.rooms }} rooms per floor</p></div><div class="actions compact"><button :disabled="busy" @click="task(refresh)"><RefreshCw :size="16"/>Refresh</button><button :disabled="busy" @click="downloadAccounts"><Download :size="16"/>Unit accounts</button><button v-if="user.role === 'superadmin'" class="clear-button" :disabled="busy" @click="clearOpen=!clearOpen; confirmation=''"><span>Clear Setup</span></button></div></div>
+      <MapEditor v-else-if="screen === 'map-editor' && mapData && user?.role === 'superadmin'" :key="editorKey" ref="editor" :map="mapData" :save="saveMap" :initializing="busy" @saved="mapData=$event" @dirty="mapUnsaved=$event" @initialize="configure" @exit="showMap" @reload="reloadMap"/>
+      <section v-else-if="screen === 'map' && mapData?.phase === 'active'">
+        <div class="page-head"><div><span class="eyebrow">Responder workspace · Disaster map</span><h2>{{ mapData.name }}</h2><p>Click a building block to see only that block’s emergency situation.</p></div><div class="actions"><button :disabled="busy" @click="task(refresh)"><RefreshCw :size="16"/>Refresh</button><button v-if="user.role === 'superadmin'" :disabled="busy" @click="editMap">Edit map</button><button v-if="user.role === 'superadmin'" class="clear-button" :disabled="busy" @click="clearOpen=!clearOpen; confirmation=''"><span>Clear Setup</span></button></div></div>
+        <div v-if="clearOpen" class="card clear-confirm"><h3>Delete this disaster’s data?</h3><p>This deletes its map, unit accounts, reports, and found items. Manager accounts remain.</p><form @submit.prevent="clearSetup"><label class="field"><span>Type CLEAR to confirm</span><input v-model="confirmation" autocomplete="off"></label><button class="danger" :disabled="busy || confirmation !== 'CLEAR'">Delete disaster data</button></form></div>
+        <FloorPlan :map="mapData" @open="openBlock"/><div class="map-block-links" aria-label="Building blocks"><button v-for="block in mapData.blocks" :key="block.building" :disabled="busy" @click="openBlock(block.building)">{{ block.label }} · {{ block.floors }} floors · {{ block.rooms }} units per floor<ArrowRight :size="16"/></button></div>
+      </section>
+      <section v-else-if="screen === 'dashboard' && incident && selectedBlock">
+        <button class="back-link" :disabled="busy" @click="showMap"><ArrowLeft :size="17"/>Back to disaster map</button>
+        <div class="page-head"><div><span class="eyebrow">Responder workspace · Safety overview</span><h2>{{ selectedBlock.label }} · {{ mapData.name }}</h2><p>{{ selectedBlock.floors }} floors · {{ selectedBlock.rooms }} units per floor</p></div><div class="actions compact"><button :disabled="busy" @click="task(refresh)"><RefreshCw :size="16"/>Refresh</button><button :disabled="busy" @click="downloadAccounts"><Download :size="16"/>Unit accounts</button></div></div>
         <div v-if="clearOpen" class="card clear-confirm" role="region" aria-label="Confirm clear setup"><h3>Delete this disaster’s data?</h3><p>This permanently deletes its layout, unit accounts, safety reports, and found items. Admin and Super Admin accounts remain.</p><form @submit.prevent="clearSetup"><label class="field"><span>Type CLEAR to confirm</span><input v-model="confirmation" autocomplete="off" :disabled="busy"></label><div class="actions compact"><button class="danger" :disabled="busy || confirmation !== 'CLEAR'">{{ busy ? 'Clearing…' : 'Delete disaster data' }}</button><button type="button" :disabled="busy" @click="clearOpen=false">Cancel</button></div></form></div>
+        <div v-if="!dashboardReady" class="card empty-state" role="status">Loading this block’s safety reports…</div><template v-else>
         <div class="summary"><div class="metric help"><span>Needs help</span><strong>{{ counts.help }}</strong></div><div class="metric safe"><span>Reported safe</span><strong>{{ counts.safe }}</strong></div><div class="metric"><span>No response</span><strong>{{ counts.none }}</strong></div></div>
-        <div class="priority"><h3><TriangleAlert :size="19"/>Urgent help requests · Building {{ String.fromCharCode(65+building) }}</h3><p v-if="!urgent.length">No help requests reported for this building.</p><div v-else class="help-list"><button v-for="report in urgent" :key="report._id" @click="selectUnit(report.floor,report.room)"><strong>Unit {{ report.username }}</strong><span>{{ displayDetail(report.situation) }} · Location: {{ displayDetail(report.location) }}</span><ArrowRight :size="16"/></button></div></div>
-        <div class="card grid-panel"><div class="panel-head"><h3>Unit status by floor</h3><small>Refreshes every 5 seconds{{ updated ? ' · '+formatTime(updated) : '' }}</small></div><div class="tabs" aria-label="Buildings"><button v-for="b in incident.buildings" :key="b" :aria-pressed="building===b-1" :class="{ active: building===b-1 }" @click="building=b-1; selectedUnit=null">Building {{ String.fromCharCode(64+b) }}</button></div><div class="legend"><span><i class="swatch safe"></i>Safe</span><span><i class="swatch help"></i>Needs help</span><span><i class="swatch none"></i>No response</span></div><div class="grid-scroll"><div class="unit-grid" :style="{ gridTemplateColumns: `64px repeat(${incident.rooms}, minmax(56px,1fr))`, minWidth: `${64+incident.rooms*61}px` }"><div class="grid-label">Floor</div><div v-for="r in incident.rooms" :key="'h'+r" class="grid-label">Room {{ String(r).padStart(2,'0') }}</div><template v-for="f in floorNumbers" :key="f"><div class="grid-label floor-label">{{ f }} / F</div><button v-for="r in incident.rooms" :key="`${f}:${r}`" class="unit-cell" :class="reportMap.get(`${building}:${f}:${r}`)?.status || 'none'" :aria-label="`Unit ${label(building,f,r)}: ${statusText(reportMap.get(`${building}:${f}:${r}`)?.status)}`" @click="selectUnit(f,r)">{{ label(building,f,r) }}<span>{{ statusText(reportMap.get(`${building}:${f}:${r}`)?.status) }}</span></button></template></div></div>
-        <div v-if="selectedUnit" class="unit-detail" tabindex="0"><h3>Unit {{ selectedUnit.username }} · {{ statusText(selectedUnit.report?.status) }}</h3><template v-if="selectedUnit.report"><dl><template v-if="selectedUnit.report.status === 'help'"><dt>Situation</dt><dd>{{ displayDetail(selectedUnit.report.situation) }}</dd><dt>Current location</dt><dd>{{ displayDetail(selectedUnit.report.location) }}</dd><dt>Contact</dt><dd>{{ displayDetail(selectedUnit.report.contact) }}</dd></template><template v-else><dt>Family contact</dt><dd>{{ displayDetail(selectedUnit.report.familyPhone) }}</dd></template><dt>Reported</dt><dd>{{ formatTime(selectedUnit.report.createdAt) }} (HKT)</dd></dl></template><p v-else>No safety report has been submitted by this unit.</p></div></div><p class="footnote">Each account represents one unit. A report does not verify the safety of every person in the household.</p>
+        <div class="priority"><h3><TriangleAlert :size="19"/>Urgent help requests · {{ selectedBlock.label }}</h3><p v-if="!urgent.length">No help requests reported for this building.</p><div v-else class="help-list"><button v-for="report in urgent" :key="report._id" @click="selectUnit(report.floor,report.room)"><strong>Unit {{ report.username }}</strong><span>{{ displayDetail(report.situation) }} · Location: {{ displayDetail(report.location) }}</span><ArrowRight :size="16"/></button></div></div>
+        <div class="card grid-panel"><div class="panel-head"><h3>Unit status by floor</h3><small>Refreshes every 5 seconds{{ updated ? ' · '+formatTime(updated) : '' }}</small></div><div class="legend"><span><i class="swatch safe"></i>Safe</span><span><i class="swatch help"></i>Needs help</span><span><i class="swatch none"></i>No response</span></div><div class="grid-scroll"><div class="unit-grid" :style="{ gridTemplateColumns: `64px repeat(${selectedBlock.rooms}, minmax(56px,1fr))`, minWidth: `${64+selectedBlock.rooms*61}px` }"><div class="grid-label">Floor</div><div v-for="r in selectedBlock.rooms" :key="'h'+r" class="grid-label">Room {{ String(r).padStart(2,'0') }}</div><template v-for="f in floorNumbers" :key="f"><div class="grid-label floor-label">{{ f }} / F</div><button v-for="r in selectedBlock.rooms" :key="`${f}:${r}`" class="unit-cell" :class="reportMap.get(`${building}:${f}:${r}`)?.status || 'none'" :aria-label="`Unit ${label(building,f,r)}: ${statusText(reportMap.get(`${building}:${f}:${r}`)?.status)}`" @click="selectUnit(f,r)">{{ label(building,f,r) }}<span>{{ statusText(reportMap.get(`${building}:${f}:${r}`)?.status) }}</span></button></template></div></div>
+        <div v-if="selectedUnit" class="unit-detail" tabindex="0"><h3>Unit {{ selectedUnit.username }} · {{ statusText(selectedUnit.report?.status) }}</h3><template v-if="selectedUnit.report"><dl><template v-if="selectedUnit.report.status === 'help'"><dt>Situation</dt><dd>{{ displayDetail(selectedUnit.report.situation) }}</dd><dt>Current location</dt><dd>{{ displayDetail(selectedUnit.report.location) }}</dd><dt>Contact</dt><dd>{{ displayDetail(selectedUnit.report.contact) }}</dd></template><template v-else><dt>Family contact</dt><dd>{{ displayDetail(selectedUnit.report.familyPhone) }}</dd></template><dt>Reported</dt><dd>{{ formatTime(selectedUnit.report.createdAt) }} (HKT)</dd></dl></template><p v-else>No safety report has been submitted by this unit.</p></div></div><p class="footnote">Each account represents one unit. A report does not verify the safety of every person in the household.</p></template>
       </section>
 
       <section v-else-if="screen === 'resident' && incident" class="resident-main">
@@ -240,7 +283,7 @@ onUnmounted(() => clearInterval(timer));
 
       <section v-else-if="screen === 'detail' && item" class="lost-main"><button class="back-link" :disabled="busy" @click="loadItems(false)"><ArrowLeft :size="17"/>Back to items</button><div class="card item-detail"><img :src="photoUrl(item._id)" alt="Photo of the found item"><div><span class="eyebrow">Found item · {{ item.category }}</span><h2>{{ item.description }}</h2><dl><dt><MapPin :size="16"/>Place found</dt><dd>{{ item.place }}</dd><dt><Phone :size="16"/>Finder contact</dt><dd>{{ item.contact }}</dd><dt>Reported by</dt><dd>{{ item.createdBy }}</dd><dt>Reported at</dt><dd>{{ formatTime(item.createdAt) }} (HKT)</dd></dl><p class="hint">Contact the finder and describe identifying details to arrange a return.</p></div></div></section>
     </main>
-    <nav v-if="user && incident" class="bottom-nav" aria-label="Main navigation"><button :disabled="busy" :aria-current="!lostScreen ? 'page' : undefined" :class="{ selected: !lostScreen }" @click="navigate(manager ? 'dashboard' : 'resident')"><House :size="21"/>報平安 · Safety</button><button :disabled="busy" :aria-current="lostScreen ? 'page' : undefined" :class="{ selected: lostScreen }" @click="navigate('lost')"><Search :size="21"/>Lost & Found</button></nav>
+    <nav v-if="user && incident" class="bottom-nav" aria-label="Main navigation"><button :disabled="busy" :aria-current="!lostScreen ? 'page' : undefined" :class="{ selected: !lostScreen }" @click="navigate(manager ? 'map' : 'resident')"><House :size="21"/>報平安 · Safety</button><button :disabled="busy" :aria-current="lostScreen ? 'page' : undefined" :class="{ selected: lostScreen }" @click="navigate('lost')"><Search :size="21"/>Lost & Found</button></nav>
     <footer>Auto Safety Report · Final Year Project · Localhost testing</footer>
   </div>
 </template>

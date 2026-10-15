@@ -8,10 +8,15 @@ Base URL: `http://127.0.0.1:3001/api`. Browser requests go through the frontend'
 | POST | `/auth/login` | Public | Accepts username/password, sets session cookie |
 | POST | `/auth/logout` | Signed in | Revokes session and clears cookie |
 | GET | `/auth/me` | Signed in | Account details without password hash |
-| GET | `/incident` | Signed in | Active disaster, or null for managers before setup |
-| POST | `/incident` | Admin / Super Admin | Creates name/layout and unit accounts |
+| GET | `/incident` | Signed in | Active disaster, or null for Super Admin before setup |
+| POST | `/incident` | Super Admin | Initializes saved map and generates per-block accounts |
 | DELETE | `/incident` | Super Admin | Clears disaster after `confirmation: "CLEAR"` |
 | GET | `/incident/accounts` | Admin / Super Admin | Generated account list without hashes |
+| GET | `/map` | Admin / Super Admin | Latest map metadata, blocks, annotations (no image bytes) |
+| GET | `/map/image` | Admin / Super Admin | Stored PNG |
+| GET | `/map/events` | Admin / Super Admin | Authenticated server-sent update events |
+| POST | `/map` | Super Admin | Uploads PNG; replacing an image requires its revision |
+| PATCH | `/map` | Super Admin | Autosaves drawings, labels, and draft layouts |
 | GET | `/reports/mine` | Resident | This unit's existing report or null |
 | POST | `/reports` | Resident | Immediately saves the chosen status, before optional details |
 | PATCH | `/reports/mine` | Resident | Finalizes optional details for the signed-in unit |
@@ -21,7 +26,13 @@ Base URL: `http://127.0.0.1:3001/api`. Browser requests go through the frontend'
 | GET | `/items/:id/photo` | Signed in, active disaster | Decoded JPEG photo |
 | POST | `/items` | Signed in, active disaster | Creates a found-item record |
 
-Setup body: `{ "name": "Local test", "buildings": 1, "floors": 20, "rooms": 8 }`. Limits: 1–8 buildings, 1–40 floors, 1–20 rooms per floor. A second setup returns 409 until Super Admin clears the first.
+Upload: `POST /map` with `{ "image": "data:image/png;base64,..." }`; replacing an image requires `revision`. Only still PNG images up to 4 MB and 25 megapixels are accepted. The backend sanitizes, re-encodes, and bounds stored image size.
+
+Save: `PATCH /map` with `{ "revision": 1, "name": "Disaster area", "blocks": [{ "building": 0, "label": "Block A", "floors": 3, "rooms": 2 }], "annotations": [{ "id": "a", "type": "block", "building": 0, "x": 0.5, "y": 0.5 }] }`. Coordinates are normalized to [0,1]. Building markers can also include `w` and `h` as fractions of map width and height (minimum 0.04 and 0.03); both dimensions must be supplied together, and the whole centered label must fit inside the map. Older markers without dimensions keep their automatic size until resized. Other types: pen (points/color/width), rectangle (x/y/w/h/color/width), text (x/y/text/color/fontSize). Limits: eight blocks, 1–40 floors and 1–20 units per floor for each block, 200 drawings, bounded point counts and document size. Notes render as plain text.
+
+Initialize: `POST /incident` with `{ "mapRevision": 2 }`. Each block needs a clickable label. Before initialization, only Super Admin can authenticate. Accounts are generated per block. Existing pre-map incidents are linked without recreating accounts or reports. Active floor/unit layouts remain locked; names, label positions, and drawings remain editable. Successful edits increment the revision and publish a map event; stale revisions return 409.
+
+`GET /dashboard?building=0` returns counts and reports for that block only. Omitting the query returns aggregate counts. Invalid indexes return 400. Clear Setup also removes the map and blocks Admin/resident login until the next initialization.
 
 Button press: `POST /reports` with `{ "status": "safe" }` or `{ "status": "help" }`. This immediately saves one report for the signed-in unit with blank optional fields and `detailsSubmittedAt: null`. A first save returns 201, an identical status retry returns 200 without creating another report, and choosing the other status afterward returns 409. Unit identity always comes from the authenticated account.
 
