@@ -4,7 +4,8 @@ import cookieParser from 'cookie-parser';
 import { rateLimit } from 'express-rate-limit';
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import sharp from 'sharp';
-import { ApiError, text, phone, unitName, hashPassword, verifyPassword, publicUser, mutationQueue } from './lib.js';
+import { ApiError, text, phone, hashPassword, verifyPassword, publicUser, mutationQueue } from './lib.js';
+import { blockUnitName } from '../shared/blocks.js';
 import { deleteIncidentData } from './db.js';
 import { createSessionStore } from './sessions.js';
 import { mapProjection, incidentBlocks, pngImage, validateMap, assertSameLayout, requireMarkers } from './maps.js';
@@ -18,10 +19,10 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
   const mutate = mutationQueue();
   const sessions = createSessionStore();
   const mapClients = new Set();
-  const publishMap = () => {
+  const publishMap = (event = 'map') => {
     for (const client of mapClients) {
       if (!sessions.get(client.sessionId)) { client.res.end(); continue; }
-      client.res.write('event: map\ndata: {}\n\n');
+      client.res.write(`event: ${event}\ndata: {}\n\n`);
     }
   };
   app.disable('x-powered-by');
@@ -142,13 +143,13 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
     publishMap();res.status(201).json({ map });
   });
   app.patch('/api/map', auth, role('superadmin'), async (req, res) => {
-    const fields = validateMap(req.body);
     const map = await mutate(async () => {
       if (!sessions.get(req.sessionId)) throw new ApiError(401, 'Please log in again.');
       const existing = await db.collection('disaster_maps').findOne({ _id: 'current' }, mapProjection);
       if (!existing) throw new ApiError(409, 'Upload a disaster map first.');
       if (req.body.revision !== existing.revision) throw new ApiError(409, 'The map changed in another window. Reload the saved map. Your local edits have not overwritten it.');
       const incident = await db.collection('incidents').findOne({ _id: 'current' });
+      const fields = validateMap(req.body, incident ? incidentBlocks(incident) : []);
       if (incident) assertSameLayout(fields.blocks, incident);
       if (existing.phase === 'active') requireMarkers(fields);
       const result = await db.collection('disaster_maps').updateOne({ _id: 'current', revision: existing.revision }, { $set: { ...fields, updatedAt: new Date() }, $inc: { revision: 1 } });
@@ -173,12 +174,14 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
         if (result.matchedCount !== 1) throw new ApiError(409, 'The map changed. Reload the saved map.');
         return { incident: existing, count: await db.collection('users').countDocuments({ incidentId: existing.incidentId }), preserved: true };
       }
-      const incident = { _id: 'current', incidentId: randomUUID(), name: map.name, buildings: map.blocks.length, blocks: map.blocks, floors: map.blocks[0].floors, rooms: map.blocks[0].rooms, status: 'provisioning', createdAt: new Date(), createdBy: req.user.username };
+      // Validate again so a draft saved by an older backend gets named prefixes too.
+      map.blocks = validateMap(map).blocks;
+      const incident = { _id: 'current', incidentId: randomUUID(), name: map.name, buildings: map.blocks.length, blocks: map.blocks, blockIdentityVersion: 1, floors: map.blocks[0].floors, rooms: map.blocks[0].rooms, status: 'provisioning', createdAt: new Date(), createdBy: req.user.username };
       await db.collection('incidents').insertOne(incident);
       try {
         const accounts = [];
         for (const block of map.blocks) for (let f = 1; f <= block.floors; f++) for (let r = 1; r <= block.rooms; r++) {
-          const username = unitName(map.blocks.length, block.building, f, r);
+          const username = blockUnitName(block, f, r);
           accounts.push({ _id: username, username, role: 'user', incidentId: incident.incidentId, building: block.building, floor: f, room: r, createdAt: new Date() });
         }
         for (let i = 0; i < accounts.length; i += 16) {
@@ -186,7 +189,7 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
           await Promise.all(batch.map(async user => { user.passwordHash = await hashPassword(user.username); }));
           await db.collection('users').insertMany(batch, { ordered: true });
         }
-        const saved = await db.collection('disaster_maps').updateOne({ _id: 'current', revision: map.revision }, { $set: { phase: 'active', incidentId: incident.incidentId, updatedAt: new Date() }, $inc: { revision: 1 } });
+        const saved = await db.collection('disaster_maps').updateOne({ _id: 'current', revision: map.revision }, { $set: { phase: 'active', incidentId: incident.incidentId, blocks: map.blocks, updatedAt: new Date() }, $inc: { revision: 1 } });
         if (saved.matchedCount !== 1) throw new ApiError(409, 'The map changed. Reload the saved map.');
         await db.collection('incidents').updateOne({ _id: 'current', incidentId: incident.incidentId }, { $set: { status: 'active' } });
         return { incident: { ...incident, status: 'active' }, count: accounts.length, preserved: false };
@@ -259,6 +262,38 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
     });
     res.json({ report });
   });
+  app.patch('/api/floors/:building/:floor', auth, role('admin', 'superadmin'), async (req, res) => {
+    const building = Number(req.params.building), floor = Number(req.params.floor);
+    if (!/^\d+$/.test(req.params.building) || !/^\d+$/.test(req.params.floor) || !Number.isSafeInteger(building) || !Number.isSafeInteger(floor)) throw new ApiError(400, 'Choose a valid building and floor.');
+    if (!['not_started', 'cleared', 'inaccessible'].includes(req.body.status)) throw new ApiError(400, 'Choose a valid floor search status.');
+    if (!Number.isSafeInteger(req.body.revision) || req.body.revision < 0) throw new ApiError(400, 'Reload the floor status before updating it.');
+    const status = req.body.status, note = text(req.body.note, 'Floor note', 300, true);
+    const expectedIncident = text(req.body.incidentId, 'Disaster identifier', 100);
+    if (status === 'inaccessible' && !note) throw new ApiError(400, 'Add a short reason why this floor cannot be searched.');
+    const result = await mutate(async () => {
+      const incident = await stillAuthorized(req);
+      if (incident.incidentId !== expectedIncident) throw new ApiError(409, 'This floor belongs to a previous disaster. Reload the current setup.');
+      const map = await db.collection('disaster_maps').findOne({ _id: 'current' }, mapProjection);
+      if (map?.phase !== 'active' || map.incidentId !== incident.incidentId) throw new ApiError(409, 'Initialize the disaster map first.');
+      if (!map.blocks[building] || floor < 1 || floor > map.blocks[building].floors) throw new ApiError(400, 'Choose a floor in this building.');
+      const id = `${incident.incidentId}:${building}:${floor}`;
+      const existing = await db.collection('floor_searches').findOne({ _id: id });
+      if (existing && existing.status === status && existing.note === note) return existing;
+      if ((existing?.revision || 0) !== req.body.revision) throw new ApiError(409, 'Another responder updated this floor. Reload its latest status before changing it.');
+      const updatedAt = new Date();
+      const record = { _id: id, incidentId: incident.incidentId, building, floor, status, note, revision: (existing?.revision || 0) + 1, updatedAt, updatedBy: req.user.username, createdAt: existing?.createdAt || updatedAt };
+      if (existing) {
+        const { _id, ...fields } = record;
+        const saved = await db.collection('floor_searches').updateOne({ _id: id, revision: existing.revision }, { $set: fields });
+        if (saved.matchedCount !== 1) throw new ApiError(409, 'This floor changed. Reload its latest status.');
+      } else {
+        try { await db.collection('floor_searches').insertOne(record); }
+        catch (error) { if (error.code === 11000) throw new ApiError(409, 'Another responder updated this floor. Reload its latest status.'); throw error; }
+      }
+      return record;
+    });
+    publishMap('floor-search');res.json({ floorSearch: result });
+  });
   app.get('/api/dashboard', auth, role('admin', 'superadmin'), async (req, res) => {
     const incident = await active();
     const map = await db.collection('disaster_maps').findOne({ _id: 'current' }, mapProjection);
@@ -272,7 +307,10 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
     const reports = await db.collection('safety_reports').find({ incidentId: incident.incidentId, ...(selected === null ? {} : { building: selected }) }).toArray();
     const safe = reports.filter(r => r.status === 'safe').length, help = reports.filter(r => r.status === 'help').length;
     const total = blocks.filter(b => selected === null || b.building === selected).reduce((n, b) => n + b.floors * b.rooms, 0);
-    res.json({ incident: { ...incident, name: map.name, blocks }, reports, building: selected, counts: { safe, help, none: total - safe - help } });
+    const floorSearches = (await db.collection('floor_searches').find({ incidentId: incident.incidentId, ...(selected === null ? {} : { building: selected }) }).toArray()).filter(record => blocks[record.building] && Number.isInteger(record.floor) && record.floor >= 1 && record.floor <= blocks[record.building].floors && ['not_started', 'cleared', 'inaccessible'].includes(record.status));
+    const floorTotal = blocks.filter(b => selected === null || b.building === selected).reduce((n, b) => n + b.floors, 0);
+    const cleared = floorSearches.filter(f => f.status === 'cleared').length, inaccessible = floorSearches.filter(f => f.status === 'inaccessible').length;
+    res.json({ incident: { ...incident, name: map.name, blocks }, reports, building: selected, counts: { safe, help, none: total - safe - help }, floorSearches, searchProgress: { cleared, inaccessible, pending: floorTotal - cleared - inaccessible, total: floorTotal } });
   });
   app.get('/api/items', auth, async (req, res) => {
     const incident = await active();

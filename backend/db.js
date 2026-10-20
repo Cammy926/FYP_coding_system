@@ -1,6 +1,7 @@
 import { MongoClient } from 'mongodb';
 import { hashPassword } from './lib.js';
 import { createStore, COLLECTION_NAMES } from './store.js';
+import { repairBlockAccounts } from './block-accounts.js';
 export const COLLECTIONS = Object.keys(COLLECTION_NAMES);
 export async function connectDatabase(uri, name) {
   if (!uri) throw new Error('MONGODB_URI is missing in backend/.env.');
@@ -18,7 +19,7 @@ export async function initializeDatabase(db, passwords = {}) {
       try { await db.createCollection(name); } catch (e) { if (e.code !== 48) throw e; }
     }
   }
-  for (const name of ['users', 'safety_reports', 'found_items']) await store.collection(name).createIndex({ incidentId: 1 });
+  for (const name of ['users', 'safety_reports', 'found_items', 'floor_searches']) await store.collection(name).createIndex({ incidentId: 1 });
   for (const role of ['superadmin', 'admin']) {
     if (!await store.collection('users').findOne({ _id: role })) {
       await store.collection('users').insertOne({ _id: role, username: role, role, passwordHash: await hashPassword(passwords[role] || role), createdAt: new Date() });
@@ -31,10 +32,11 @@ export async function initializeDatabase(db, passwords = {}) {
     if (incident.status === 'provisioning') await store.collection('disaster_maps').updateOne({ _id: 'current', incidentId: incident.incidentId }, { $set: { phase: 'draft', incidentId: null } });
     await deleteIncidentData(store, incident);
   }
+  await repairBlockAccounts(store);
   return store;
 }
 export async function deleteIncidentData(db, incident) {
   const query = { incidentId: incident.incidentId };
-  for (const name of ['safety_reports', 'found_items', 'users', 'disaster_maps']) await db.collection(name).deleteMany(query);
+  for (const name of ['safety_reports', 'found_items', 'users', 'disaster_maps', 'floor_searches']) await db.collection(name).deleteMany(query);
   await db.collection('incidents').deleteOne({ _id: 'current', incidentId: incident.incidentId });
 }

@@ -10,6 +10,8 @@ import sharp from 'sharp';
 import { connectDatabase, initializeDatabase } from '../db.js';
 import { createApp } from '../app.js';
 import { hashPassword } from '../lib.js';
+import { repairBlockAccounts } from '../block-accounts.js';
+import { readFile, readdir } from 'node:fs/promises';
 import { COLLECTION_NAMES, createStore } from '../store.js';
 import { migrateLegacyCollection } from '../migration.js';
 
@@ -26,11 +28,14 @@ test('Auto Safety Report end-to-end API and persistence', { timeout: 120000 }, a
   let mongoFailure;
   mongo.on('error',e => { mongoFailure=e; });
   let client, server, base;
-  const cookies = new Map();
+  const cookies = new Map();let currentIncidentId;
   async function request(actor, route, method='GET', body, extraHeaders={}) {
+    if(route.startsWith('/api/floors/') && body) body={incidentId:currentIncidentId,...body};
     const response = await fetch(base+route, { method, headers: { 'Content-Type':'application/json', ...(cookies.has(actor) ? { Cookie:cookies.get(actor) } : {}), ...extraHeaders }, ...(body !== undefined ? { body:JSON.stringify(body) } : {}) });
     const cookie = response.headers.get('set-cookie'); if (cookie) cookies.set(actor,cookie.split(';')[0]);
-    return { status:response.status, body: await response.json().catch(()=>null) };
+    const result={ status:response.status, body: await response.json().catch(()=>null) };
+    if(route==='/api/incident' && method==='POST' && response.status===201) currentIncidentId=result.body.incident.incidentId;
+    return result;
   }
   async function logIn(actor, username=actor) {
     const result=await request(actor,'/api/auth/login','POST',{username,password:username});assert.equal(result.status,200,JSON.stringify(result.body));return result;
@@ -158,9 +163,43 @@ test('Auto Safety Report end-to-end API and persistence', { timeout: 120000 }, a
       for(const dimensions of [{w:0,h:.1},{w:1.1,h:.1},{w:.2},{w:.2,h:.1,x:.99}]) {
         const invalid=await request('superadmin','/api/map','PATCH',{...current,annotations:current.annotations.map(a=>a.id===sized.id?{...a,...dimensions,...(!('h' in dimensions)?{h:undefined}:{})}:a)});assert.equal(invalid.status,400);
       }
+      const fontUpdate=await request('superadmin','/api/map','PATCH',{...current,annotations:current.annotations.map(a=>a.id===sized.id?{...a,fontSize:28}:a)});
+      assert.equal(fontUpdate.status,200,JSON.stringify(fontUpdate.body));current=fontUpdate.body.map;
+      const label=current.annotations.find(a=>a.id===sized.id);assert.equal(label.fontSize,28);assert.equal(label.w,.24);assert.equal(label.h,.12);
+      assert.equal(current.annotations.find(a=>a.type==='block'&&a.building===1).fontSize,undefined);
+      for(const fontSize of [0,7,73,'large',null]) {
+        assert.equal((await request('superadmin','/api/map','PATCH',{...current,annotations:current.annotations.map(a=>a.id===sized.id?{...a,fontSize}:a)})).status,400);
+      }
       assert.equal(await db.collection('users').countDocuments(),accountsBefore);
       assert.deepEqual((await db.collection('incidents').findOne({_id:'current'})).blocks,current.blocks);
-      await initializeDatabase(rawDb);const persisted=await db.collection('disaster_maps').findOne({_id:'current'});assert.equal(persisted.annotations.find(a=>a.id===sized.id).w,.24);assert.equal(persisted.annotations.length,5);assert.equal(await db.collection('safety_reports').countDocuments(),4);
+      await initializeDatabase(rawDb);const persisted=await db.collection('disaster_maps').findOne({_id:'current'});assert.equal(persisted.annotations.find(a=>a.id===sized.id).w,.24);assert.equal(persisted.annotations.find(a=>a.id===sized.id).fontSize,28);assert.equal(persisted.annotations.length,5);assert.equal(await db.collection('safety_reports').countDocuments(),4);
+    });
+    await t.test('floor search progress syncs live, preserves reports, and rejects stale or unauthorized edits', async () => {
+      const reportsBefore=await db.collection('safety_reports').find({}).toArray();
+      assert.equal((await request('admin','/api/floors/0/1','PATCH',{status:'cleared',revision:0,incidentId:'old-disaster'})).status,409);
+      assert.equal((await request('admin','/api/floors/0/1','PATCH',{status:'cleared',revision:0,incidentId:undefined})).status,400);
+      assert.equal((await request('resident','/api/floors/0/1','PATCH',{status:'cleared',revision:0})).status,403);
+      assert.equal((await request('anonymous','/api/floors/0/1','PATCH',{status:'cleared',revision:0})).status,401);
+      for(const [path,body] of [['/api/floors/0/0',{status:'cleared',revision:0}],['/api/floors/0/4',{status:'cleared',revision:0}],['/api/floors/9/1',{status:'cleared',revision:0}],['/api/floors/0/1',{status:'inaccessible',revision:0}],['/api/floors/0/1',{status:'done',revision:0}],['/api/floors/0/1',{status:'cleared',revision:'0'}],['/api/floors/0/1',{status:'inaccessible',revision:0,note:'x'.repeat(301)}]]) assert.equal((await request('admin',path,'PATCH',body)).status,400);
+      const stream=await fetch(base+'/api/map/events',{headers:{Cookie:cookies.get('superadmin')}});const reader=stream.body.getReader();await reader.read();let cleared;
+      try {
+        cleared=await request('admin','/api/floors/0/1','PATCH',{status:'cleared',revision:0});assert.equal(cleared.status,200);assert.equal(cleared.body.floorSearch.updatedBy,'admin');
+        const event=await Promise.race([reader.read(),new Promise((_,reject)=>setTimeout(()=>reject(new Error('Floor update event missing')),3000))]);assert.ok(new TextDecoder().decode(event.value).includes('event: floor-search'));
+      } finally {await reader.cancel();}
+      assert.equal((await request('superadmin','/api/floors/0/1','PATCH',{status:'cleared',revision:0})).status,200);
+      assert.equal(await db.collection('floor_searches').countDocuments(),1);
+      const a=await request('superadmin','/api/dashboard?building=0');assert.deepEqual(a.body.searchProgress,{cleared:1,inaccessible:0,pending:2,total:3});assert.equal(a.body.floorSearches[0].floor,1);
+      const blocked=await request('superadmin','/api/floors/1/1','PATCH',{status:'inaccessible',revision:0,note:'Fire blocks the stairwell'});assert.equal(blocked.status,200);
+      const b=await request('admin','/api/dashboard?building=1');assert.deepEqual(b.body.searchProgress,{cleared:0,inaccessible:1,pending:3,total:4});assert.equal(b.body.floorSearches[0].note,'Fire blocks the stairwell');
+      assert.deepEqual((await request('admin','/api/dashboard')).body.searchProgress,{cleared:1,inaccessible:1,pending:5,total:7});
+      assert.equal((await request('superadmin','/api/floors/0/1','PATCH',{status:'inaccessible',revision:0,note:'Old information'})).status,409);
+      const reopened=await request('superadmin','/api/floors/0/1','PATCH',{status:'not_started',revision:cleared.body.floorSearch.revision,note:'Search again'});assert.equal(reopened.status,200);assert.equal(reopened.body.floorSearch.revision,2);
+      const race=await Promise.all([request('admin','/api/floors/0/2','PATCH',{status:'cleared',revision:0}),request('superadmin','/api/floors/0/2','PATCH',{status:'inaccessible',revision:0,note:'Collapsed access'})]);assert.deepEqual(race.map(r=>r.status).sort(),[200,409]);
+      assert.deepEqual(await db.collection('safety_reports').find({}).toArray(),reportsBefore);
+      assert.deepEqual((await request('admin','/api/dashboard')).body.counts,{safe:2,help:2,none:14});
+      await new Promise(resolve=>server.close(resolve));await initializeDatabase(rawDb);await startHttp(db);
+      await logIn('admin');await logIn('superadmin');await logIn('resident','A-201');await logIn('resident2','B-302');
+      const persisted=await request('admin','/api/dashboard?building=1');assert.equal(persisted.body.floorSearches[0].note,'Fire blocks the stairwell');assert.equal(persisted.body.searchProgress.inaccessible,1);
     });
     await t.test('found items validate real images, preserve details, and search literal words', async () => {
       const details={description:'Mickey Mouse toy',place:'Building A lobby',category:'Toys',contact:'finder@example.com'};
@@ -190,7 +229,7 @@ test('Auto Safety Report end-to-end API and persistence', { timeout: 120000 }, a
       for(const name of ['incidents','safety_reports','found_items']) assert.equal(await db.collection(name).countDocuments(),0);
       assert.equal(await db.collection('users').countDocuments(),2);
       assert.equal((await request('admin','/api/auth/me')).status,401);assert.equal((await request('superadmin','/api/auth/me')).status,200);
-      assert.equal(await db.collection('disaster_maps').countDocuments(),0);
+      assert.equal(await db.collection('disaster_maps').countDocuments(),0);assert.equal(await db.collection('floor_searches').countDocuments(),0);
     });
     await t.test('startup recovers interrupted setup and deletion', async () => {
       for (const status of ['provisioning','clearing']) {
@@ -205,7 +244,83 @@ test('Auto Safety Report end-to-end API and persistence', { timeout: 120000 }, a
       }
       const map=await setupMap([{building:0,label:'Block A',floors:2,rooms:1}],'Next disaster');
       assert.equal((await request('superadmin','/api/incident','POST',{mapRevision:map.revision})).status,201);
-      await logIn('next','201');assert.equal((await request('next','/api/reports/mine')).body.report,null);
+      await logIn('next','A-201');assert.equal((await request('next','/api/reports/mine')).body.report,null);
+    });
+    await t.test('named blocks route accounts and reports correctly when D is placed before A', async () => {
+      const store=await initializeDatabase(client.db('named_block_regression'));
+      const namedServer=createApp(store,{rateLimits:false}).listen(0,'127.0.0.1');await once(namedServer,'listening');
+      const namedBase=`http://127.0.0.1:${namedServer.address().port}/api`, sessions=new Map();
+      async function call(actor,route,method='GET',body) {
+        const response=await fetch(namedBase+route,{method,headers:{'Content-Type':'application/json',...(sessions.has(actor)?{Cookie:sessions.get(actor)}:{})},...(body?{body:JSON.stringify(body)}:{})});
+        const cookie=response.headers.get('set-cookie');if(cookie)sessions.set(actor,cookie.split(';')[0]);
+        return {status:response.status,body:await response.json()};
+      }
+      const login=async username=>assert.equal((await call(username,'/auth/login','POST',{username,password:username})).status,200);
+      try {
+        await login('superadmin');
+        const uploaded=await call('superadmin','/map','POST',{image:png});
+        const input={...uploaded.body.map,blocks:[{building:0,label:'Block D',floors:3,rooms:4},{building:1,label:'Block A',floors:2,rooms:4}],annotations:[{id:'d',type:'block',building:0,x:.25,y:.5},{id:'a',type:'block',building:1,x:.75,y:.5}]};
+        const duplicate=await call('superadmin','/map','PATCH',{...input,blocks:input.blocks.map(b=>({...b,label:b.building?'Block D rescue':'Block D'}))});assert.equal(duplicate.status,400);
+        const saved=await call('superadmin','/map','PATCH',input);assert.equal(saved.status,200,JSON.stringify(saved.body));
+        assert.deepEqual(saved.body.map.blocks.map(b=>b.accountPrefix),['D','A']);
+        assert.equal((await call('superadmin','/incident','POST',{mapRevision:saved.body.map.revision})).status,201);
+        await login('admin');
+        const accounts=(await call('admin','/incident/accounts')).body.accounts;assert.equal(accounts.length,20);
+        assert.ok(accounts.filter(a=>a.building===0).every(a=>a.username.startsWith('D-')));
+        assert.ok(accounts.filter(a=>a.building===1).every(a=>a.username.startsWith('A-')));
+        assert.ok(accounts.some(a=>a.username==='D-304'));assert.ok(!accounts.some(a=>a.username==='A-301'));
+        for(const [username,status] of [['A-101','help'],['A-104','safe'],['D-101','safe']]) {
+          await login(username);const report=await call(username,'/reports','POST',{status,building:99});assert.equal(report.status,201);
+          assert.equal(report.body.report.building,username.startsWith('A-')?1:0);
+        }
+        const d=(await call('admin','/dashboard?building=0')).body,a=(await call('admin','/dashboard?building=1')).body;
+        assert.deepEqual(d.counts,{safe:1,help:0,none:11});assert.deepEqual(a.counts,{safe:1,help:1,none:6});
+        assert.ok(d.reports.every(r=>r.username.startsWith('D-')));assert.deepEqual(a.reports.map(r=>r.username).sort(),['A-101','A-104']);
+        let map=(await call('superadmin','/map')).body.map;
+        const rename=await call('superadmin','/map','PATCH',{...map,blocks:map.blocks.map(b=>b.building===0?{...b,label:'Block C'}:b)});assert.equal(rename.status,409);
+        const descriptive=await call('superadmin','/map','PATCH',{...map,blocks:map.blocks.map(b=>b.building===0?{...b,label:'Block D rescue area'}:b)});assert.equal(descriptive.status,200);
+        await initializeDatabase(client.db('named_block_regression'));
+        assert.equal((await store.collection('users').findOne({_id:'A-101'})).building,1);
+        assert.equal((await store.collection('safety_reports').findOne({username:'A-104'})).building,1);
+        // A newly configured single named block also uses that block's letter.
+        assert.equal((await call('superadmin','/incident','DELETE',{confirmation:'CLEAR'})).status,200);
+        const single=await call('superadmin','/map','POST',{image:png});
+        map=(await call('superadmin','/map','PATCH',{...single.body.map,blocks:[{building:0,label:'Block D',floors:1,rooms:1}],annotations:[{id:'d-only',type:'block',building:0,x:.5,y:.5}]})).body.map;
+        assert.equal((await call('superadmin','/incident','POST',{mapRevision:map.revision})).status,201);
+        await login('D-101');assert.equal(await store.collection('users').countDocuments({_id:'101'}),0);
+      } finally {await new Promise(resolve=>namedServer.close(resolve));}
+    });
+    await t.test('old order-based accounts and saved reports are repaired with a private backup and keep map/search data', async () => {
+      const store=await initializeDatabase(client.db('old_block_regression'));
+      const blocks=[{building:0,label:'Block D',floors:3,rooms:4},{building:1,label:'Block A',floors:2,rooms:4}];
+      const incident={_id:'current',incidentId:'wrong-order',status:'active',buildings:2,blocks};
+      const map={_id:'current',incidentId:incident.incidentId,phase:'active',blocks,revision:5,image:{data:'preserve-map'},annotations:[{id:'d',type:'block',building:0,x:.25,y:.5,w:.1,h:.1,fontSize:24}]};
+      await store.collection('incidents').insertOne(incident);await store.collection('disaster_maps').insertOne(map);
+      const passwordHash=await hashPassword('custom-password'),users=[];
+      for(const b of blocks)for(let f=1;f<=b.floors;f++)for(let r=1;r<=b.rooms;r++) {const username=`${b.building?'B':'A'}-${f}${String(r).padStart(2,'0')}`;users.push({_id:username,username,role:'user',incidentId:incident.incidentId,building:b.building,floor:f,room:r,passwordHash});}
+      await store.collection('users').insertMany(users);
+      const reports=['A-101','A-104'].map((username,i)=>({_id:`wrong-order:${username}`,incidentId:incident.incidentId,userId:username,username,building:0,floor:1,room:i?4:1,status:i?'safe':'help',situation:'preserve details',createdAt:new Date()}));
+      await store.collection('safety_reports').insertMany(reports);
+      const floor={_id:'wrong-order:0:1',incidentId:incident.incidentId,building:0,floor:1,status:'inaccessible',note:'Blocked stairs',revision:1};await store.collection('floor_searches').insertOne(floor);
+      const item={_id:'item',incidentId:incident.incidentId,createdBy:'A-101',photo:'preserved-photo'};await store.collection('found_items').insertOne(item);
+      const backupDirectory=path.join(dataDir,'private-backups');
+      const result=await repairBlockAccounts(store,{backupDirectory});assert.equal(result.movedReports,2);assert.equal(result.movedAccounts,8);assert.equal(result.createdAccounts,12);
+      const backup=JSON.parse(await readFile(result.backupPath,'utf8'));assert.equal(backup.users.length,20);assert.equal(backup.reports.length,2);
+      assert.equal((await store.collection('users').findOne({_id:'A-101'})).passwordHash,passwordHash);
+      assert.equal((await store.collection('users').findOne({_id:'A-101'})).building,1);assert.equal((await store.collection('users').findOne({_id:'D-304'})).building,0);
+      assert.equal(await store.collection('users').countDocuments({incidentId:incident.incidentId}),20);assert.equal(await store.collection('users').countDocuments({_id:'A-301'}),0);
+      for(const report of reports) assert.deepEqual(await store.collection('safety_reports').findOne({_id:report._id}),{...report,building:1});
+      assert.deepEqual(await store.collection('floor_searches').findOne({_id:floor._id}),floor);assert.deepEqual(await store.collection('found_items').findOne({_id:item._id}),item);
+      const fixedMap=await store.collection('disaster_maps').findOne({_id:'current'});assert.deepEqual(fixedMap.image,map.image);assert.deepEqual(fixedMap.annotations,map.annotations);
+      assert.deepEqual(fixedMap.blocks.map(b=>b.accountPrefix),['D','A']);
+      assert.equal(await repairBlockAccounts(store,{backupDirectory}),null);assert.equal((await readdir(backupDirectory)).length,1);
+      await initializeDatabase(client.db('old_block_regression'));assert.equal((await store.collection('safety_reports').findOne({username:'A-101'})).building,1);
+      // Fail before any write if a report cannot fit the named block's layout.
+      await store.collection('incidents').updateOne({_id:'current'},{$unset:{blockIdentityVersion:''}});
+      await store.collection('safety_reports').insertOne({_id:'outside',incidentId:incident.incidentId,username:'A-301',userId:'A-301',building:0,floor:3,room:1,status:'help'});
+      const before=await store.collection('users').find({}).toArray();
+      await assert.rejects(repairBlockAccounts(store,{backupDirectory}),/outside its named block layout/);
+      assert.deepEqual(await store.collection('users').find({}).toArray(),before);assert.equal(await store.collection('safety_reports').countDocuments({}),3);
     });
     await t.test('adding a map to the previous setup preserves resident accounts and reports', async () => {
       const legacyDb=client.db('legacy_map_setup');const store=await initializeDatabase(legacyDb);
@@ -226,7 +341,7 @@ test('Auto Safety Report end-to-end API and persistence', { timeout: 120000 }, a
         assert.equal((await legacy('/reports/mine')).body.report.status,'safe');
       } finally {await new Promise(resolve=>legacyServer.close(resolve));}
     });
-    await t.test('database keeps five data collections and never creates sessions after login or startup', async () => {
+    await t.test('database keeps six data collections and never creates sessions after login or startup', async () => {
       assert.deepEqual((await rawDb.listCollections({}, {nameOnly:true}).toArray()).map(c=>c.name).sort(),Object.values(COLLECTION_NAMES).sort());
       const manager=await rawDb.collection('user').findOne({_id:'admin'});
       assert.equal(manager.role,'admin');assert.equal(manager.recordType,undefined);

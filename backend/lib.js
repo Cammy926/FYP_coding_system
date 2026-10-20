@@ -25,10 +25,6 @@ export function scale(body) {
     return [key, body[key]];
   }));
 }
-export function unitName(buildings, building, floor, room) {
-  const unit = `${floor}${String(room).padStart(2, '0')}`;
-  return buildings === 1 ? unit : `${String.fromCharCode(65 + building)}-${unit}`;
-}
 export async function hashPassword(password) {
   const salt = randomBytes(16).toString('hex');
   const hash = await scrypt(password, salt, 64);

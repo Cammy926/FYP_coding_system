@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed, onBeforeUnmount, onMounted } from 'vue';
 import FloorPlan from './FloorPlan.vue';
+import { codeFromLabel, blockUnitName } from '../../shared/blocks.js';
 const props = defineProps({ map: { type: Object, required: true }, save: { type: Function, required: true }, initializing: Boolean });
 const emit = defineEmits(['saved', 'initialize', 'exit', 'reload', 'dirty']);
 const copy = value => JSON.parse(JSON.stringify(value));
@@ -12,6 +13,7 @@ const layoutLocked = computed(() => model.value.phase === 'active' || !!model.va
 const chosen = computed(() => model.value.annotations.find(a => a.id === selected.value));
 const canDelete = computed(() => chosen.value && !(layoutLocked.value && chosen.value.type === 'block'));
 const unplaced = computed(() => model.value.blocks.filter(b => !model.value.annotations.some(a => a.type === 'block' && a.building === b.building)));
+const modalPrefix = computed(() => modal.value ? codeFromLabel(modal.value.label) || modal.value.accountPrefix : '');
 const ready = computed(() => model.value.blocks.length > 0 && !unplaced.value.length && !pending.value && !saving.value && !error.value && !modal.value);
 let timeout, running, gesture, placing = null, alive = true;
 const fields = () => copy({ name: model.value.name, blocks: model.value.blocks, annotations: model.value.annotations });
@@ -53,7 +55,7 @@ function placeBlock(building) { placing = building; tool.value = 'block'; select
 function editBlock(block) {
   const marker = model.value.annotations.find(a => a.type === 'block' && a.building === block.building);
   if (!marker) { placeBlock(block.building); return; }
-  modal.value = { type: 'block', building: block.building, label: block.label, floors: block.floors, rooms: block.rooms, x: marker.x, y: marker.y, markerId: marker.id };
+  modal.value = { type: 'block', building: block.building, label: block.label, accountPrefix: block.accountPrefix, floors: block.floors, rooms: block.rooms, x: marker.x, y: marker.y, markerId: marker.id };
 }
 function start(p) {
   if (modal.value || props.initializing) return;
@@ -61,7 +63,8 @@ function start(p) {
     const existing = placing !== null ? model.value.blocks[placing] : unplaced.value[0]; placing = null;
     if (!existing && (layoutLocked.value || model.value.blocks.length >= 8)) { error.value = 'All building labels are placed. Use Select / move to reposition them.'; return; }
     const building = existing?.building ?? model.value.blocks.length;
-    modal.value = { type: 'block', building, label: existing?.label || `Block ${String.fromCharCode(65 + building)}`, floors: existing?.floors || 20, rooms: existing?.rooms || 8, x: p.x, y: p.y };
+    const nextPrefix = Array.from('ABCDEFGHIJKLMNOPQRSTUVWXYZ').find(code => !model.value.blocks.some(b => b.accountPrefix === code || codeFromLabel(b.label) === code));
+    modal.value = { type: 'block', building, label: existing?.label || `Block ${nextPrefix}`, accountPrefix: existing?.accountPrefix ?? nextPrefix, floors: existing?.floors || 20, rooms: existing?.rooms || 8, x: p.x, y: p.y };
     return;
   }
   if (tool.value === 'text') { modal.value = { type: 'text', text: '', fontSize: 20, x: p.x, y: p.y }; return; }
@@ -113,15 +116,30 @@ function resizeSelected(axis, percentage) {
   chosen.value.x = Math.max(dimensions.w / 2, Math.min(1 - dimensions.w / 2, chosen.value.x));
   chosen.value.y = Math.max(dimensions.h / 2, Math.min(1 - dimensions.h / 2, chosen.value.y)); changed();
 }
+function setLabelFontSize(value) {
+  if (chosen.value?.type !== 'block' || props.initializing) return;
+  const automatic = value.trim() === '';
+  const fontSize = automatic ? undefined : Math.max(8, Math.min(72, Math.round(Number(value))));
+  if ((!automatic && !Number.isFinite(fontSize)) || chosen.value.fontSize === fontSize) return;
+  remember();
+  if (automatic) delete chosen.value.fontSize; else chosen.value.fontSize = fontSize;
+  changed();
+}
 function resizeKey(event) { selected.value = event.id; blockSize.value = event.size; resizeSelected(event.axis, currentBlockSize()[event.axis] * 100 + event.delta); }
 function confirmModal() {
   const m = modal.value;
   const label = m.type === 'block' ? m.label.trim() : m.text.trim();
   if (!label) return;
   if (m.type === 'block' && model.value.blocks.some(b => b.building !== m.building && b.label.toLowerCase() === label.toLowerCase())) { error.value = 'Block labels must be unique.'; return; }
+  const accountPrefix = layoutLocked.value ? model.value.blocks[m.building]?.accountPrefix : modalPrefix.value;
+  if (m.type === 'block') {
+    if (layoutLocked.value && codeFromLabel(label) && codeFromLabel(label) !== (accountPrefix || codeFromLabel(model.value.blocks[m.building].label))) { error.value = 'Keep the initialized block letter when editing its label.'; return; }
+    if (accountPrefix !== '' && !/^[A-Z]$/.test(accountPrefix || '')) { error.value = 'Choose an account prefix from A to Z.'; return; }
+    if (model.value.blocks.some(b => b.building !== m.building && b.accountPrefix === accountPrefix)) { error.value = 'Each block must have a different account prefix.'; return; }
+  }
   remember();
   if (m.type === 'block') {
-    model.value.blocks[m.building] = { building: m.building, label, floors: m.floors, rooms: m.rooms };
+    model.value.blocks[m.building] = { building: m.building, label, accountPrefix, floors: m.floors, rooms: m.rooms };
     let marker = model.value.annotations.find(a => a.type === 'block' && a.building === m.building);
     if (!marker) { marker = { id: crypto.randomUUID(), type: 'block', building: m.building }; model.value.annotations.push(marker); }
     Object.assign(marker, { x: m.x, y: m.y }); selected.value = marker.id;
@@ -148,9 +166,9 @@ defineExpose({ flush });
     </div>
     <p class="map-instruction">{{ tool === 'block' ? 'Click the map to place a building label and set its floors and units.' : tool === 'text' ? 'Click the map to add a note or emoji.' : tool === 'select' ? 'Drag a selected label to move it. Drag its corner handle, or use Block size, to resize it.' : 'Drag on the map to draw.' }}</p>
     <div class="map-workspace"><FloorPlan :map="model" editable :tool="tool" :selected="selected" :preview="preview" @start="start" @move="move" @end="end" @cancel="cancel" @resize-key="resizeKey"/>
-      <aside class="card block-settings"><label class="field"><span>Disaster name</span><input v-model="model.name" maxlength="100" required :disabled="initializing" @change="remember(); changed()"></label><section v-if="chosen?.type === 'block'" class="block-size-controls" aria-label="Selected block size"><h3>Block size</h3><label class="field"><span>Block width (% of map)</span><input type="number" min="4" max="100" step="0.1" :value="Math.round(currentBlockSize().w * 1000) / 10" :disabled="initializing" @change="resizeSelected('w', $event.target.value)"></label><label class="field"><span>Block height (% of map)</span><input type="number" min="3" max="100" step="0.1" :value="Math.round(currentBlockSize().h * 1000) / 10" :disabled="initializing" @change="resizeSelected('h', $event.target.value)"></label><p class="hint">Changes the visible label size. Floor and unit counts stay the same.</p></section><h3>Building blocks</h3><p v-if="!model.blocks.length">Choose Building block, then click the map to add your first block.</p><div v-for="block in model.blocks" :key="block.building" class="block-setting"><strong>{{ block.label }}</strong><small>{{ block.floors }} floors · {{ block.rooms }} units per floor</small><button @click="editBlock(block)">{{ unplaced.some(b=>b.building===block.building) ? 'Place' : 'Edit' }} {{ block.label }}</button></div><p v-if="layoutLocked" class="hint">Existing accounts are preserved. Floor and unit counts are locked; names, label positions, and other drawings can be edited.</p><p v-if="layoutLocked && chosen?.type === 'block'" class="hint">Move this building label instead of deleting it, so responders can still open the block.</p></aside></div>
+      <aside class="card block-settings"><label class="field"><span>Disaster name</span><input v-model="model.name" maxlength="100" required :disabled="initializing" @change="remember(); changed()"></label><section v-if="chosen?.type === 'block'" class="block-size-controls" aria-label="Selected block size"><h3>Block size</h3><label class="field"><span>Block width (% of map)</span><input type="number" min="4" max="100" step="0.1" :value="Math.round(currentBlockSize().w * 1000) / 10" :disabled="initializing" @change="resizeSelected('w', $event.target.value)"></label><label class="field"><span>Block height (% of map)</span><input type="number" min="3" max="100" step="0.1" :value="Math.round(currentBlockSize().h * 1000) / 10" :disabled="initializing" @change="resizeSelected('h', $event.target.value)"></label><label class="field"><span>Label font size (px)</span><input aria-label="Label font size (px)" aria-describedby="label-font-hint" type="number" min="8" max="72" step="1" :value="chosen.fontSize ?? ''" placeholder="Automatic" :disabled="initializing" @change="setLabelFontSize($event.target.value)"><small id="label-font-hint">8–72 px. Leave blank for automatic size. Enlarge the block if larger text needs more space.</small></label><p class="hint">Label and text sizes save automatically. Floor and unit counts stay the same.</p></section><h3>Building blocks</h3><p v-if="!model.blocks.length">Choose Building block, then click the map to add your first block.</p><div v-for="block in model.blocks" :key="block.building" class="block-setting"><strong>{{ block.label }}</strong><small>{{ block.floors }} floors · {{ block.rooms }} units per floor</small><button @click="editBlock(block)">{{ unplaced.some(b=>b.building===block.building) ? 'Place' : 'Edit' }} {{ block.label }}</button></div><p v-if="layoutLocked" class="hint">Existing accounts are preserved. Floor and unit counts and account prefixes are locked; label descriptions, positions, and other drawings can be edited.</p><p v-if="layoutLocked && chosen?.type === 'block'" class="hint">Move this building label instead of deleting it, so responders can still open the block.</p></aside></div>
     <div v-if="modal" class="map-modal-backdrop"><form class="card map-modal" role="dialog" aria-modal="true" :aria-label="modal.type === 'block' ? 'Configure building block' : 'Add map note'" @submit.prevent="confirmModal">
-      <template v-if="modal.type === 'block'"><h3>Configure building block</h3><label class="field"><span>Block label</span><input v-model="modal.label" autofocus maxlength="60" required></label><div class="fields"><label class="field"><span>Floors in this block</span><input v-model.number="modal.floors" type="number" min="1" max="40" required :disabled="layoutLocked"></label><label class="field"><span>Units per floor</span><input v-model.number="modal.rooms" type="number" min="1" max="20" required :disabled="layoutLocked"></label></div></template>
+      <template v-if="modal.type === 'block'"><h3>Configure building block</h3><label class="field"><span>Block label</span><input v-model="modal.label" autofocus maxlength="60" required></label><label v-if="!codeFromLabel(modal.label) && !layoutLocked" class="field"><span>Account prefix</span><input v-model="modal.accountPrefix" maxlength="1" pattern="[A-Z]" required></label><p class="hint">Unit accounts: {{ blockUnitName({ accountPrefix: layoutLocked ? model.blocks[modal.building]?.accountPrefix : modalPrefix }, 1, 1) }}. The account prefix is fixed after initialization.</p><div class="fields"><label class="field"><span>Floors in this block</span><input v-model.number="modal.floors" type="number" min="1" max="40" required :disabled="layoutLocked"></label><label class="field"><span>Units per floor</span><input v-model.number="modal.rooms" type="number" min="1" max="20" required :disabled="layoutLocked"></label></div></template>
       <template v-else><h3>Add map note</h3><label class="field"><span>Text or emoji</span><input v-model="modal.text" maxlength="120" required></label><div class="emoji-tools"><button v-for="emoji in ['🚑','🚒','🚧','⚠️','🆘','🍔','🍟','💧']" :key="emoji" type="button" :aria-label="`Insert ${emoji}`" @click="modal.text += emoji">{{ emoji }}</button></div><label class="field"><span>Text size</span><input v-model.number="modal.fontSize" type="number" min="12" max="48" required></label></template>
       <div class="actions"><button class="primary">{{ modal.type === 'block' ? 'Place block' : 'Add note' }}</button><button type="button" @click="modal=null">Cancel</button></div>
     </form></div>

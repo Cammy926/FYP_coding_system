@@ -1,5 +1,6 @@
 import sharp from 'sharp';
 import { ApiError, text } from './lib.js';
+import { codeFromLabel } from '../shared/blocks.js';
 
 export const mapProjection = { projection: { 'image.data': 0 } };
 export function mapMetadata(map) {
@@ -8,7 +9,8 @@ export function mapMetadata(map) {
   return { ...map, image };
 }
 export function incidentBlocks(incident) {
-  return incident.blocks || Array.from({ length: incident.buildings }, (_, building) => ({ building, label: `Block ${String.fromCharCode(65 + building)}`, floors: incident.floors, rooms: incident.rooms }));
+  const blocks = incident.blocks || Array.from({ length: incident.buildings }, (_, building) => ({ building, label: `Block ${String.fromCharCode(65 + building)}`, floors: incident.floors, rooms: incident.rooms }));
+  return blocks.map(b => ({ ...b, accountPrefix: b.accountPrefix ?? (incident.buildings === 1 ? '' : String.fromCharCode(65 + b.building)) }));
 }
 export async function pngImage(value) {
   if (typeof value !== 'string' || !/^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(value) || value.length > 5600000) throw new ApiError(400, 'Choose a PNG map up to 4 MB.');
@@ -24,15 +26,20 @@ export async function pngImage(value) {
   } catch { throw new ApiError(400, 'The map cannot be read. Upload a valid PNG up to 4 MB and 25 megapixels.'); }
   throw new ApiError(400, 'The map is too detailed to store. Please upload a smaller PNG.');
 }
-export function validateMap(body) {
+export function validateMap(body, existingBlocks = []) {
   const name = text(body.name, 'Disaster name', 100);
   if (!Array.isArray(body.blocks) || body.blocks.length > 8) throw new ApiError(400, 'Use up to eight building blocks.');
-  const labels = new Set();
+  const labels = new Set(), prefixes = new Set();
   const blocks = body.blocks.map((block, building) => {
     if (!block || block.building !== building || !Number.isInteger(block.floors) || block.floors < 1 || block.floors > 40 || !Number.isInteger(block.rooms) || block.rooms < 1 || block.rooms > 20) throw new ApiError(400, 'Each block needs 1–40 floors and 1–20 rooms per floor.');
     const label = text(block.label, 'Block label', 60);
+    // Empty prefixes only exist for preserved, older single-building accounts.
+    const legacy = existingBlocks[building]?.accountPrefix === '';
+    const accountPrefix = legacy ? '' : codeFromLabel(label) || block.accountPrefix;
+    if ((!legacy && !/^[A-Z]$/.test(accountPrefix || '')) || prefixes.has(accountPrefix)) throw new ApiError(400, 'Each block needs a unique account prefix (A–Z). Use a label such as Block D or choose its account prefix.');
+    prefixes.add(accountPrefix);
     if (labels.has(label.toLowerCase())) throw new ApiError(400, 'Block labels must be unique.');
-    labels.add(label.toLowerCase()); return { building, label, floors: block.floors, rooms: block.rooms };
+    labels.add(label.toLowerCase()); return { building, label, accountPrefix, floors: block.floors, rooms: block.rooms };
   });
   if (!Array.isArray(body.annotations) || body.annotations.length > 200) throw new ApiError(400, 'Use up to 200 drawings.');
   const ids = new Set(), markers = new Set(); let points = 0;
@@ -56,6 +63,7 @@ export function validateMap(body) {
     if (a.type === 'block') {
       if (!Number.isInteger(a.building) || !blocks[a.building] || markers.has(a.building)) throw new ApiError(400, 'Each block can have one clickable label.');
       const p = position(a), dimensions = {};
+      if (a.fontSize !== undefined) dimensions.fontSize = number(a.fontSize, 8, 72);
       // Older labels keep their natural size until explicitly resized.
       if (a.w !== undefined || a.h !== undefined) {
         dimensions.w = number(a.w, 0.04, 1); dimensions.h = number(a.h, 0.03, 1);
@@ -71,6 +79,7 @@ export function validateMap(body) {
 export function assertSameLayout(blocks, incident) {
   const existing = incidentBlocks(incident);
   if (blocks.length !== existing.length || blocks.some((b, i) => b.building !== existing[i].building || b.floors !== existing[i].floors || b.rooms !== existing[i].rooms)) throw new ApiError(409, 'Existing unit layouts are locked. You can move labels, rename blocks, and change drawings.');
+  if (blocks.some((b, i) => b.accountPrefix !== existing[i].accountPrefix || (b.accountPrefix === '' && codeFromLabel(b.label) !== codeFromLabel(existing[i].label)))) throw new ApiError(409, 'An initialized block cannot change its account prefix. Keep its block letter when editing the label.');
 }
 export function requireMarkers(map) {
   if (!map.blocks.length || map.blocks.some(b => !map.annotations.some(a => a.type === 'block' && a.building === b.building))) throw new ApiError(400, 'Place one clickable building label for every block before initializing.');

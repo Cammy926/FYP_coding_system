@@ -7,12 +7,13 @@ Server: the configured Azure Cosmos DB MongoDB endpoint. Database: `auto_safety_
 | user | _id=username, username, role, passwordHash, createdAt; residents also have incidentId, building, floor, room |
 | incidents | _id=current, incidentId UUID, name, buildings, floors, rooms, status, createdAt, createdBy |
 | safety_reports | _id=incidentId:username; incidentId, userId, username, building, floor, room, status, situation, location, contact, familyPhone, detailsSubmittedAt, notificationStatus, createdAt |
+| floor_searches | _id=incidentId:building:floor; incidentId, building, floor, status, note, revision, createdAt, updatedAt, updatedBy |
 | disaster_maps | _id=current; sanitized PNG, imageId, name, blocks, annotations, phase, incidentId, revision, createdAt, updatedAt |
 | found_items | _id UUID; incidentId, description, place, category, contact, photo JPEG data URL, createdBy, createdAt |
 
 `backend/store.js` maps the API's logical `users` group to the physical `user` collection. Other groups use the collection names shown above. Documents use ordinary application IDs without recordType or recordId wrappers. A clear operation removes the active incident's records only; manager accounts remain. Future search features can add their own collections to this database.
 
-Building indexes are zero-based (A=0), and floors and rooms are one-based. Single-building account names concatenate floor and two-digit room, e.g. floor 2 / room 4 → 204. Multiple buildings add a letter prefix, e.g. A-204. No-response units are derived from the layout rather than storing empty reports.
+Building indexes are zero-based map references, not block letters: index 0 can be Block D. Floors and rooms are one-based. Each block saves a unique accountPrefix (A–Z), derived from labels such as Block D or chosen for a custom label. New accounts use this prefix, e.g. D-204. Older preserved single-building setups use an empty prefix and keep names such as 204. No-response units are derived from the layout rather than storing empty reports.
 
 Passwords use Node scrypt with individual random salts. Sessions store token hashes, not the raw cookie. Manager passwords from `.env` seed only new accounts; changing those variables does not reset existing passwords.
 
@@ -50,8 +51,22 @@ Existing unrelated Azure databases and collections are untouched. The frontend/b
 
 One current map is saved in disaster_maps. Its sanitized PNG and vector annotations occupy one bounded document. Metadata endpoints omit image bytes; the image has an authenticated endpoint. Normalized coordinates keep drawings aligned across screen sizes. Revision checks reject stale edits with 409. Manager windows receive live update events and reload the latest map; periodic refresh also recovers missed events.
 
-Each block stores a label, stable building index, floors, and units per floor. Counts and account generation sum each block independently. Renaming a map label does not change resident account IDs. Every initialized block retains a clickable marker. Drawing types are pen, rectangle, text/emoji, and block marker.
+Each block stores a label, stable building index, accountPrefix, floors, and units per floor. Counts and account generation sum each block independently. Editing a label description does not change resident account IDs; changing its block letter/account prefix after initialization is rejected. Every initialized block retains a clickable marker. Drawing types are pen, rectangle, text/emoji, and block marker.
 
 New maps begin as drafts. Initialization reserves a provisioning incident, creates accounts in batches, links the map, and activates the incident. Interrupted provisioning retains the draft map and removes partial accounts. Interrupted clearing removes the map and incident data. For existing incidents, map setup links to their existing layout and preserves accounts and reports. Only Super Admin can log in until the map is active and linked. Map writes require Super Admin; admins can read and open block overviews.
 
 Building label size is independent of floor/unit layouts. Optional normalized marker w/h fields store the visible width/height with its centered x/y position. Existing markers without these fields retain their original automatic sizing. Resizing, including after initialization, uses the same autosave, revision checks, and live manager updates as other drawing edits.
+
+Building marker annotations may include fontSize (8–72 px), independent of their w/h and floor/unit layout. Existing markers without it retain automatic responsive font sizing. Font edits use the same autosave/revision/live-update flow and persist without a database migration.
+
+## Floor search state
+
+floor_searches stores one current record per incident, building, and floor. Its deterministic _id prevents duplicates and isolates equal floor numbers in different blocks or disasters. An incidentId index supports overview queries and cleanup. Status is cleared, inaccessible, or not_started; an absent record also means not_started. Inaccessible records need a reason; notes are limited to 300 characters.
+
+PATCH operations validate the active map layout, role, and session, then use revision checks to prevent lost updates. Identical retries do not double-count progress. Reopening saves a new revision rather than deleting the record, so old editor windows cannot overwrite it with revision 0. Write acknowledgments precede success and live floor-search events. UI merges per-record revisions so an older background poll cannot undo a newer saved floor state.
+
+This collection is independent of safety_reports: clearing a floor means a team completed its search, not that every resident is safe. No status, help details, contacts, or timestamps in safety_reports are changed. Progress sums floor counts independently of unit counts and separates inaccessible floors from completed searches. Incident clear/recovery also removes its floor-search records.
+
+## Block identity upgrade
+
+`blockIdentityVersion: 1` marks incidents using named prefixes. Before HTTP starts, `backend/block-accounts.js` upgrades older active maps. It resolves block letters independently of placement order, verifies every report fits its named block’s layout, and writes an EJSON snapshot with restricted file permissions in ignored `backend/.backups/` before changing records. It preserves existing account IDs/password hashes and report content while correcting building references by username; it creates missing accounts and removes unused out-of-layout accounts only after backup. Map image/annotations, found items, and floor_searches are preserved. The version marker is written last so interrupted repairs can be rerun. Ambiguous prefixes, conflicting accounts, or unmappable reports stop startup for review before writes. Old single-building unprefixed accounts remain unchanged.

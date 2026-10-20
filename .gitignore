@@ -8,6 +8,7 @@ dist/
 test-results/
 playwright-report/
 backend/.server.lock
+backend/.backups/
 data/
 logs/
 runtime/

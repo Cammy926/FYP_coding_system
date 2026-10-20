@@ -34,6 +34,7 @@ try {
   for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, async () => { await stop(); process.exit(0); });
 } catch (error) {
   console.error(`Backend startup failed (${error.name}, code ${error.code || 'none'}).`);
+  if (error.code === 'BLOCK_IDENTITY_REPAIR') console.error(error.message);
   if (String(error.message).includes('Subscription owning the database account is disabled')) console.error('Azure says the subscription owning this database is disabled. Reactivate it in Azure before using this connection.');
   if (String(error.message).startsWith('Local MongoDB')) console.error(error.message);
   console.error(ownsLock ? 'Check backend/.env, internet access, database credentials, and the Cosmos DB firewall. No database URI is logged.' : 'Another backend may already be running.');

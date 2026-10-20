@@ -2,12 +2,29 @@
 import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue';
 import FloorPlan from './FloorPlan.vue';
 import MapEditor from './MapEditor.vue';
+import { blockUnitName } from '../../shared/blocks.js';
 import { ShieldCheck, LogOut, House, Search, CircleCheck, TriangleAlert, ArrowRight, ArrowLeft, Upload, RefreshCw, Download, PackageSearch, MapPin, Phone, Check, LockKeyhole } from 'lucide-vue-next';
 
 const user = ref(null), incident = ref(null), screen = ref('login'), busy = ref(false), initializing = ref(true);
 const error = ref(''), notice = ref(''), online = ref(false), updated = ref(null);
 const reports = ref([]), myReport = ref(null), building = ref(0), selectedUnit = ref(null);
 const counts = reactive({ safe: 0, help: 0, none: 0 });
+const floorSearches = ref([]), floorDraft = ref(null);
+const floorMap = computed(() => new Map(floorSearches.value.filter(f => f.building === building.value).map(f => [f.floor, f])));
+const floorStatus = floor => floorMap.value.get(floor)?.status || 'not_started';
+const searchProgress = computed(() => {
+  const selected = screen.value === 'dashboard' ? building.value : null;
+  const blocks = mapData.value?.blocks || [];
+  const total = blocks.filter(b => selected === null || b.building === selected).reduce((sum, b) => sum + b.floors, 0);
+  const records = floorSearches.value.filter(f => selected === null || f.building === selected);
+  const cleared = records.filter(f => f.status === 'cleared').length, inaccessible = records.filter(f => f.status === 'inaccessible').length;
+  return { total, cleared, inaccessible, pending: total - cleared - inaccessible };
+});
+function mergeFloorSearches(records) {
+  const merged = new Map(floorSearches.value.filter(f => f.incidentId === incident.value?.incidentId).map(f => [f._id, f]));
+  for (const record of records) if (!merged.has(record._id) || record.revision >= merged.get(record._id).revision) merged.set(record._id, record);
+  floorSearches.value = [...merged.values()];
+}
 const login = reactive({ username: '', password: '' });
 const dashboardReady = ref(false);
 const mapData = ref(null), editor = ref(null), mapUnsaved = ref(false), editorKey = ref(0);
@@ -27,7 +44,7 @@ const reportMap = computed(() => new Map(reports.value.map(r => [`${r.building}:
 const categories = ['Toys', 'Documents', 'Electronics', 'Clothing', 'Other'];
 let timer, mapEvents, polling = false;
 const formatTime = value => value ? new Date(value).toLocaleString('en-HK', { timeZone: 'Asia/Hong_Kong', dateStyle: 'medium', timeStyle: 'short' }) : '';
-const label = (b, f, r) => `${incident.value?.buildings > 1 ? String.fromCharCode(65+b)+'-' : ''}${f}${String(r).padStart(2,'0')}`;
+const label = (b, f, r) => blockUnitName(mapData.value.blocks[b], f, r);
 const photoUrl = id => `/api/items/${encodeURIComponent(id)}/photo`;
 const statusText = status => status === 'safe' ? 'Safe' : status === 'help' ? 'Needs help' : 'No response';
 
@@ -43,6 +60,7 @@ async function api(path, options = {}) {
 }
 function resetSession() {
   mapEvents?.close(); mapEvents = null; mapData.value = null; mapUnsaved.value = false;
+  floorSearches.value = []; floorDraft.value = null;
   user.value = null; incident.value = null; reports.value = []; myReport.value = null; items.value = []; item.value = null;
   login.password = ''; safety.familyPhone = ''; safety.situation = ''; safety.location = ''; safety.contact = '';
   Object.assign(found, { photo: '', description: '', place: '', category: '', contact: '' });
@@ -59,7 +77,8 @@ function watchMap() {
   mapEvents?.close(); mapEvents = null;
   if (!manager.value) return;
   mapEvents = new EventSource('/api/map/events');
-  mapEvents.addEventListener('map', () => { if (screen.value !== 'map-editor' && !busy.value) refresh().catch(e => { if (e.status === 401) resetSession(); error.value = e.message; }); });
+  const update = () => { if (screen.value !== 'map-editor' && !busy.value) refresh().catch(e => { if (e.status === 401) resetSession(); error.value = e.message; }); };
+  mapEvents.addEventListener('map', update);mapEvents.addEventListener('floor-search', update);
 }
 async function refresh() {
   const current = user.value;
@@ -79,6 +98,7 @@ async function refresh() {
     const selected = screen.value === 'dashboard' ? building.value : null;
     const dashboard = await api(`/dashboard${selected === null ? '' : '?building=' + selected}`);
     if (user.value !== current || (screen.value === 'dashboard' && building.value !== selected)) return;
+    mergeFloorSearches(dashboard.floorSearches || []);
     reports.value = dashboard.reports; Object.assign(counts, dashboard.counts); dashboardReady.value = true;
     if (selectedUnit.value) selectedUnit.value = { ...selectedUnit.value, report: reportMap.value.get(`${selectedUnit.value.building}:${selectedUnit.value.floor}:${selectedUnit.value.room}`) };
   } else {
@@ -101,8 +121,8 @@ async function reloadMap() {
   await task(async () => { mapData.value = (await api('/map')).map; mapUnsaved.value = false; editorKey.value++; if (!mapData.value) screen.value = 'map-upload'; });
 }
 async function editMap() { await task(async () => { mapData.value = (await api('/map')).map; editorKey.value++; screen.value = 'map-editor'; }); }
-async function openBlock(index) { await task(async () => { building.value = index; selectedUnit.value = null; dashboardReady.value = false; screen.value = 'dashboard'; await refresh(); }); }
-async function showMap() { screen.value = 'map'; mapUnsaved.value = false; await task(refresh); }
+async function openBlock(index) { await task(async () => { building.value = index; floorDraft.value = null; selectedUnit.value = null; dashboardReady.value = false; screen.value = 'dashboard'; await refresh(); }); }
+async function showMap() { floorDraft.value = null; screen.value = 'map'; mapUnsaved.value = false; await task(refresh); }
 async function signIn() {
   await task(async () => {
     const data = await api('/auth/login', { method: 'POST', body: login });
@@ -126,9 +146,24 @@ async function clearSetup() {
   await task(async () => {
     await api('/incident', { method: 'DELETE', body: { confirmation: confirmation.value } });
     incident.value = null; reports.value = []; items.value = []; selectedUnit.value = null; clearOpen.value = false; confirmation.value = '';
-    mapData.value = null; screen.value = 'map-upload'; notice.value = 'Setup cleared. Upload a new disaster map.';
+    mapData.value = null; floorSearches.value = []; floorDraft.value = null; screen.value = 'map-upload'; notice.value = 'Setup cleared. Upload a new disaster map.';
   });
 }
+function openFloor(floor) {
+  error.value = '';
+  const existing = floorMap.value.get(floor);
+  floorDraft.value = { incidentId: incident.value.incidentId, building: building.value, floor, status: existing?.status || 'not_started', note: existing?.note || '', revision: existing?.revision || 0 };
+}
+async function updateFloor(draft) {
+  await task(async () => {
+    const result = await api(`/floors/${draft.building}/${draft.floor}`, { method: 'PATCH', body: { incidentId: draft.incidentId, status: draft.status, note: draft.note, revision: draft.revision } });
+    mergeFloorSearches([result.floorSearch]);floorDraft.value = null;
+    notice.value = `${draft.floor}/F search status saved. Resident reports are unchanged.`;
+    await refresh();
+  });
+  if (error.value && user.value) await refresh().catch(() => {});
+}
+function clearFloor(floor) { return updateFloor({ incidentId: incident.value.incidentId, building: building.value, floor, status: 'cleared', note: '', revision: floorMap.value.get(floor)?.revision || 0 }); }
 function acceptReport(report) {
   // An older background poll must not undo a just-saved choice or completion.
   if (!report && myReport.value) return;
@@ -155,7 +190,7 @@ async function submitSafetyDetails() {
   if (error.value && incident.value) await refresh().catch(() => {});
 }
 function selectUnit(floor, room) { selectedUnit.value = { building: building.value, floor, room, username: label(building.value,floor,room), report: reportMap.value.get(`${building.value}:${floor}:${room}`) }; }
-async function navigate(destination) { if (screen.value === 'map-editor' && editor.value && !await editor.value.flush()) return; screen.value = destination; error.value = ''; notice.value = ''; clearOpen.value = false; if (destination === 'map') await task(refresh); }
+async function navigate(destination) { if (screen.value === 'map-editor' && editor.value && !await editor.value.flush()) return; screen.value = destination; floorDraft.value = null; error.value = ''; notice.value = ''; clearOpen.value = false; if (destination === 'map') await task(refresh); }
 async function loadItems(search = false) {
   await task(async () => {
     if (search && !keyword.value.trim()) throw new Error('Enter a keyword to search.');
@@ -188,8 +223,8 @@ async function uploadItem() {
 async function downloadAccounts() {
   await task(async () => {
     const data = await api('/incident/accounts');
-    const rows = [['Account','Initial password','Building','Floor','Room'], ...data.accounts.sort((a,b) => a.building-b.building || a.floor-b.floor || a.room-b.room).map(a => [a.username,a.username,String.fromCharCode(65+a.building),a.floor,a.room])];
-    const url = URL.createObjectURL(new Blob([rows.map(r=>r.join(',')).join('\n')], { type: 'text/csv;charset=utf-8' }));
+    const rows = [['Account','Initial password','Building','Floor','Room'], ...data.accounts.sort((a,b) => a.building-b.building || a.floor-b.floor || a.room-b.room).map(a => [a.username,a.username,mapData.value.blocks[a.building].accountPrefix || '',a.floor,a.room])];
+    const url = URL.createObjectURL(new Blob([rows.map(r=>r.map(v=>`"${String(v).replaceAll('"','""')}"`).join(',')).join('\n')], { type: 'text/csv;charset=utf-8' }));
     const link = document.createElement('a'); link.href = url; link.download = 'unit-accounts.csv'; link.click(); URL.revokeObjectURL(url);
   });
 }
@@ -215,6 +250,7 @@ onUnmounted(() => { clearInterval(timer); mapEvents?.close(); });
       <div class="top-actions"><span class="session-tag">{{ user ? manager ? `Responder · ${user.role === 'superadmin' ? 'Super Admin' : 'Admin'}` : `Resident · Unit ${user.username}` : 'Safety reporting + Lost & Found' }}</span><button v-if="user" class="logout" :disabled="busy" @click="signOut"><LogOut :size="16" />Log out</button></div>
     </header>
     <div class="statusbar"><span><i class="connection-dot" :class="{ online }"></i>{{ online ? 'Database connected' : 'Connecting to backend' }}</span><span>Local development · Notifications & AI search deferred</span></div>
+    <div class="app-body" :class="{ 'with-navigation': user && incident }">
     <main :aria-busy="busy || initializing">
       <div v-if="error" class="message error" role="alert"><TriangleAlert :size="19"/><span>{{ error }}</span><button aria-label="Dismiss error" @click="error=''">×</button></div>
       <div v-if="notice" class="message success" role="status"><Check :size="19"/><span>{{ notice }}</span><button aria-label="Dismiss notice" @click="notice=''">×</button></div>
@@ -239,10 +275,10 @@ onUnmounted(() => { clearInterval(timer); mapEvents?.close(); });
         <div class="page-head"><div><span class="eyebrow">Responder workspace · Safety overview</span><h2>{{ selectedBlock.label }} · {{ mapData.name }}</h2><p>{{ selectedBlock.floors }} floors · {{ selectedBlock.rooms }} units per floor</p></div><div class="actions compact"><button :disabled="busy" @click="task(refresh)"><RefreshCw :size="16"/>Refresh</button><button :disabled="busy" @click="downloadAccounts"><Download :size="16"/>Unit accounts</button></div></div>
         <div v-if="clearOpen" class="card clear-confirm" role="region" aria-label="Confirm clear setup"><h3>Delete this disaster’s data?</h3><p>This permanently deletes its layout, unit accounts, safety reports, and found items. Admin and Super Admin accounts remain.</p><form @submit.prevent="clearSetup"><label class="field"><span>Type CLEAR to confirm</span><input v-model="confirmation" autocomplete="off" :disabled="busy"></label><div class="actions compact"><button class="danger" :disabled="busy || confirmation !== 'CLEAR'">{{ busy ? 'Clearing…' : 'Delete disaster data' }}</button><button type="button" :disabled="busy" @click="clearOpen=false">Cancel</button></div></form></div>
         <div v-if="!dashboardReady" class="card empty-state" role="status">Loading this block’s safety reports…</div><template v-else>
-        <div class="summary"><div class="metric help"><span>Needs help</span><strong>{{ counts.help }}</strong></div><div class="metric safe"><span>Reported safe</span><strong>{{ counts.safe }}</strong></div><div class="metric"><span>No response</span><strong>{{ counts.none }}</strong></div></div>
+        <div class="summary search-summary"><div class="metric help"><span>Needs help</span><strong>{{ counts.help }}</strong></div><div class="metric safe"><span>Reported safe</span><strong>{{ counts.safe }}</strong></div><div class="metric"><span>No response</span><strong>{{ counts.none }}</strong></div><div class="metric floor-progress" aria-label="Floor search progress"><span>Floors cleared</span><strong>{{ searchProgress.cleared }} <small>/ {{ searchProgress.total }}</small></strong><progress :max="searchProgress.total || 1" :value="searchProgress.cleared" aria-label="Floors searched"></progress><small>{{ searchProgress.inaccessible }} inaccessible · {{ searchProgress.pending }} pending</small></div></div>
         <div class="priority"><h3><TriangleAlert :size="19"/>Urgent help requests · {{ selectedBlock.label }}</h3><p v-if="!urgent.length">No help requests reported for this building.</p><div v-else class="help-list"><button v-for="report in urgent" :key="report._id" @click="selectUnit(report.floor,report.room)"><strong>Unit {{ report.username }}</strong><span>{{ displayDetail(report.situation) }} · Location: {{ displayDetail(report.location) }}</span><ArrowRight :size="16"/></button></div></div>
-        <div class="card grid-panel"><div class="panel-head"><h3>Unit status by floor</h3><small>Refreshes every 5 seconds{{ updated ? ' · '+formatTime(updated) : '' }}</small></div><div class="legend"><span><i class="swatch safe"></i>Safe</span><span><i class="swatch help"></i>Needs help</span><span><i class="swatch none"></i>No response</span></div><div class="grid-scroll"><div class="unit-grid" :style="{ gridTemplateColumns: `64px repeat(${selectedBlock.rooms}, minmax(56px,1fr))`, minWidth: `${64+selectedBlock.rooms*61}px` }"><div class="grid-label">Floor</div><div v-for="r in selectedBlock.rooms" :key="'h'+r" class="grid-label">Room {{ String(r).padStart(2,'0') }}</div><template v-for="f in floorNumbers" :key="f"><div class="grid-label floor-label">{{ f }} / F</div><button v-for="r in selectedBlock.rooms" :key="`${f}:${r}`" class="unit-cell" :class="reportMap.get(`${building}:${f}:${r}`)?.status || 'none'" :aria-label="`Unit ${label(building,f,r)}: ${statusText(reportMap.get(`${building}:${f}:${r}`)?.status)}`" @click="selectUnit(f,r)">{{ label(building,f,r) }}<span>{{ statusText(reportMap.get(`${building}:${f}:${r}`)?.status) }}</span></button></template></div></div>
-        <div v-if="selectedUnit" class="unit-detail" tabindex="0"><h3>Unit {{ selectedUnit.username }} · {{ statusText(selectedUnit.report?.status) }}</h3><template v-if="selectedUnit.report"><dl><template v-if="selectedUnit.report.status === 'help'"><dt>Situation</dt><dd>{{ displayDetail(selectedUnit.report.situation) }}</dd><dt>Current location</dt><dd>{{ displayDetail(selectedUnit.report.location) }}</dd><dt>Contact</dt><dd>{{ displayDetail(selectedUnit.report.contact) }}</dd></template><template v-else><dt>Family contact</dt><dd>{{ displayDetail(selectedUnit.report.familyPhone) }}</dd></template><dt>Reported</dt><dd>{{ formatTime(selectedUnit.report.createdAt) }} (HKT)</dd></dl></template><p v-else>No safety report has been submitted by this unit.</p></div></div><p class="footnote">Each account represents one unit. A report does not verify the safety of every person in the household.</p></template>
+        <div class="card grid-panel"><div class="panel-head"><h3>Unit status by floor</h3><small>Refreshes every 5 seconds{{ updated ? ' · '+formatTime(updated) : '' }}</small></div><div class="legend"><span><i class="swatch safe"></i>Safe</span><span><i class="swatch help"></i>Needs help</span><span><i class="swatch none"></i>No response</span><span><i class="swatch searched"></i>Floor searched</span><span><i class="swatch inaccessible"></i>Floor inaccessible</span></div><div class="grid-scroll"><div class="unit-grid" :style="{ gridTemplateColumns: `150px repeat(${selectedBlock.rooms}, minmax(62px,1fr))`, minWidth: `${150+selectedBlock.rooms*67}px` }"><div class="grid-label">Floor</div><div v-for="r in selectedBlock.rooms" :key="'h'+r" class="grid-label">Room {{ String(r).padStart(2,'0') }}</div><template v-for="f in floorNumbers" :key="f"><div class="grid-label floor-label floor-control" :class="{ searched: floorStatus(f) === 'cleared', inaccessible: floorStatus(f) === 'inaccessible' }" :data-floor="f"><strong>{{ f }} / F</strong><span v-if="floorStatus(f) === 'cleared'" class="floor-badge">✓ Cleared</span><span v-else-if="floorStatus(f) === 'inaccessible'" class="floor-badge">⚠ Inaccessible</span><small v-if="floorMap.get(f)?.note" class="floor-note" :title="floorMap.get(f).note">{{ floorMap.get(f).note }}</small><div class="floor-actions"><button :aria-label="`Clear floor ${f}`" :disabled="busy || floorStatus(f) === 'cleared'" @click="clearFloor(f)">Clear</button><button :aria-label="`Edit search status for floor ${f}`" :disabled="busy" @click="openFloor(f)">Note / status</button></div></div><button v-for="r in selectedBlock.rooms" :key="`${f}:${r}`" class="unit-cell" :class="[reportMap.get(`${building}:${f}:${r}`)?.status || 'none', { searched: floorStatus(f) === 'cleared', inaccessible: floorStatus(f) === 'inaccessible' }]" :aria-label="`Unit ${label(building,f,r)}: ${statusText(reportMap.get(`${building}:${f}:${r}`)?.status)}`" @click="selectUnit(f,r)">{{ label(building,f,r) }}<span>{{ statusText(reportMap.get(`${building}:${f}:${r}`)?.status) }}</span></button></template></div></div>
+        <div v-if="selectedUnit" class="unit-detail" tabindex="0"><h3>Unit {{ selectedUnit.username }} · {{ statusText(selectedUnit.report?.status) }}</h3><template v-if="selectedUnit.report"><dl><template v-if="selectedUnit.report.status === 'help'"><dt>Situation</dt><dd>{{ displayDetail(selectedUnit.report.situation) }}</dd><dt>Current location</dt><dd>{{ displayDetail(selectedUnit.report.location) }}</dd><dt>Contact</dt><dd>{{ displayDetail(selectedUnit.report.contact) }}</dd></template><template v-else><dt>Family contact</dt><dd>{{ displayDetail(selectedUnit.report.familyPhone) }}</dd></template><dt>Reported</dt><dd>{{ formatTime(selectedUnit.report.createdAt) }} (HKT)</dd></dl></template><p v-else>No safety report has been submitted by this unit.</p></div></div><p class="footnote">Each account represents one unit. A report does not verify the safety of every person in the household. “Cleared” means the floor was searched; it does not change resident safe/help reports.</p></template>
       </section>
 
       <section v-else-if="screen === 'resident' && incident" class="resident-main">
@@ -282,8 +318,10 @@ onUnmounted(() => { clearInterval(timer); mapEvents?.close(); });
       <section v-else-if="screen === 'items'" class="lost-main"><button class="back-link" :disabled="busy" @click="navigate('lost')"><ArrowLeft :size="17"/>Back to Lost & Found</button><div class="page-head"><div><span class="eyebrow">Lost & Found · Browse</span><h2>All found items</h2><p>{{ items.length }} item{{ items.length===1?'':'s' }} reported for this disaster.</p></div><button :disabled="busy" @click="loadItems(false)"><RefreshCw :size="17"/>Refresh</button></div><div v-if="!items.length" class="card empty-state"><PackageSearch :size="42"/><h3>No items reported yet</h3><p>Found something? Add the first report.</p><button class="primary" @click="newFound">I Found Something</button></div><div class="item-list"><button v-for="entry in items" :key="entry._id" class="item-row" :disabled="busy" @click="openItem(entry._id)"><img :src="photoUrl(entry._id)" alt="Found item"><span><strong>{{ entry.description }}</strong><small>{{ entry.category }} · {{ entry.place }}</small><small>{{ formatTime(entry.createdAt) }}</small></span><ArrowRight :size="18"/></button></div></section>
 
       <section v-else-if="screen === 'detail' && item" class="lost-main"><button class="back-link" :disabled="busy" @click="loadItems(false)"><ArrowLeft :size="17"/>Back to items</button><div class="card item-detail"><img :src="photoUrl(item._id)" alt="Photo of the found item"><div><span class="eyebrow">Found item · {{ item.category }}</span><h2>{{ item.description }}</h2><dl><dt><MapPin :size="16"/>Place found</dt><dd>{{ item.place }}</dd><dt><Phone :size="16"/>Finder contact</dt><dd>{{ item.contact }}</dd><dt>Reported by</dt><dd>{{ item.createdBy }}</dd><dt>Reported at</dt><dd>{{ formatTime(item.createdAt) }} (HKT)</dd></dl><p class="hint">Contact the finder and describe identifying details to arrange a return.</p></div></div></section>
+      <div v-if="floorDraft && manager" class="map-modal-backdrop"><form class="card map-modal" role="dialog" aria-modal="true" :aria-label="`Floor ${floorDraft.floor} search status`" @submit.prevent="updateFloor(floorDraft)"><h3>{{ floorDraft.floor }} / F · Search status</h3><p v-if="error" class="message error" role="alert">{{ error }}</p><label class="field"><span>Search status</span><select aria-label="Search status" v-model="floorDraft.status" :disabled="busy"><option value="not_started">Not yet searched / reopen</option><option value="cleared">Cleared — search completed</option><option value="inaccessible">Inaccessible — cannot search</option></select></label><label class="field"><span>Floor note {{ floorDraft.status === 'inaccessible' ? '(required)' : '(optional)' }}</span><textarea v-model="floorDraft.note" aria-label="Floor note" maxlength="300" :required="floorDraft.status === 'inaccessible'" :disabled="busy" placeholder="e.g. Fire blocks the stairwell"></textarea></label><p class="hint">These changes update search progress only. Existing safe/help reports remain visible.</p><div class="actions"><button class="primary" :disabled="busy">Save floor status</button><button type="button" :disabled="busy" @click="floorDraft=null">Cancel</button><button type="button" :disabled="busy" @click="openFloor(floorDraft.floor)">Reload latest status</button></div></form></div>
     </main>
     <nav v-if="user && incident" class="bottom-nav" aria-label="Main navigation"><button :disabled="busy" :aria-current="!lostScreen ? 'page' : undefined" :class="{ selected: !lostScreen }" @click="navigate(manager ? 'map' : 'resident')"><House :size="21"/>報平安 · Safety</button><button :disabled="busy" :aria-current="lostScreen ? 'page' : undefined" :class="{ selected: lostScreen }" @click="navigate('lost')"><Search :size="21"/>Lost & Found</button></nav>
+    </div>
     <footer>Auto Safety Report · Final Year Project · Localhost testing</footer>
   </div>
 </template>
