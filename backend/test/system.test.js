@@ -38,6 +38,7 @@ test('Auto Safety Report end-to-end API and persistence', { timeout: 120000 }, a
     return result;
   }
   async function logIn(actor, username=actor) {
+    if (['admin', 'superadmin'].includes(username)) username += '1';
     const result=await request(actor,'/api/auth/login','POST',{username,password:username});assert.equal(result.status,200,JSON.stringify(result.body));return result;
   }
   const startHttp = async db => { server=createApp(db,{rateLimits:false}).listen(0,'127.0.0.1');await once(server,'listening');base=`http://127.0.0.1:${server.address().port}`; };
@@ -57,12 +58,29 @@ test('Auto Safety Report end-to-end API and persistence', { timeout: 120000 }, a
       const saved=await request('superadmin','/api/map','PATCH',{revision:uploaded.body.map.revision,name,blocks,annotations});assert.equal(saved.status,200,JSON.stringify(saved.body));
       return saved.body.map;
     }
+    await t.test('four manager accounts migrate safely and keep passwords on restart', async () => {
+      const raw = client.db('manager_account_migration');
+      const users = raw.collection('user');
+      await users.insertMany(await Promise.all(['superadmin','admin'].map(async role => ({_id:role,username:role,role,passwordHash:await hashPassword(role)}))));
+      const seeded = await initializeDatabase(raw);
+      assert.deepEqual((await seeded.collection('users').find({}).toArray()).map(u=>u.username).sort(), ['admin1','admin2','superadmin1','superadmin2']);
+      const hashes = (await seeded.collection('users').find({}).toArray()).map(u=>u.passwordHash);
+      await initializeDatabase(raw);
+      assert.deepEqual((await seeded.collection('users').find({}).toArray()).map(u=>u.passwordHash),hashes);
+      for (const username of ['superadmin1','superadmin2']) {
+        const response = await request(username,'/api/auth/login','POST',{username,password:username});
+        assert.equal(response.status,200);assert.equal(response.body.user.role,'superadmin');
+        assert.equal((await request(username,'/api/map')).status,200);
+      }
+      for (const username of ['admin1','admin2']) assert.equal((await request(username,'/api/auth/login','POST',{username,password:username})).status,403);
+      for (const username of ['superadmin','admin']) assert.equal((await request('retired','/api/auth/login','POST',{username,password:username})).status,401);
+    });
     await t.test('only Super Admin can log in before initialization; origin and image validation', async () => {
       assert.equal((await request('anonymous','/api/dashboard')).status,401);
       assert.equal((await request('anonymous','/api/auth/login','POST',{username:'admin',password:'wrong'})).status,401);
       assert.equal((await request('anonymous','/api/auth/login','POST',{username:{'$ne':null},password:'admin'})).status,400);
-      assert.equal((await request('anonymous','/api/auth/login','POST',{username:'admin',password:'admin'},{Origin:'https://untrusted.example'})).status,403);
-      assert.equal((await request('admin','/api/auth/login','POST',{username:'admin',password:'admin'})).status,403);
+      assert.equal((await request('anonymous','/api/auth/login','POST',{username:'admin1',password:'admin1'},{Origin:'https://untrusted.example'})).status,403);
+      assert.equal((await request('admin','/api/auth/login','POST',{username:'admin1',password:'admin1'})).status,403);
       await logIn('superadmin');assert.equal((await request('superadmin','/api/incident')).body.incident,null);
       assert.equal((await request('superadmin','/api/reports','POST',{status:'safe'})).status,403);
       assert.equal((await request('superadmin','/api/incident','POST',{})).status,400);
@@ -75,6 +93,7 @@ test('Auto Safety Report end-to-end API and persistence', { timeout: 120000 }, a
       const restored=await request('superadmin','/api/map','PATCH',{...map,revision:missing.body.map.revision});assert.equal(restored.status,200);
       const results=await Promise.all([1,2].map(()=>request('superadmin','/api/incident','POST',{mapRevision:restored.body.map.revision})));
       assert.deepEqual(results.map(r=>r.status).sort(),[201,409]);await logIn('admin');
+      await logIn('admin2');assert.equal((await request('admin2','/api/dashboard')).status,200);assert.equal((await request('admin2','/api/map','POST',{image:png})).status,403);
       const accounts=await request('admin','/api/incident/accounts');assert.equal(accounts.body.accounts.length,18);
       assert.ok(accounts.body.accounts.some(u=>u.username==='A-201'));assert.ok(accounts.body.accounts.some(u=>u.username==='B-403'));assert.ok(!accounts.body.accounts.some(u=>u.username==='A-401'));
       assert.ok(accounts.body.accounts.every(u=>!('passwordHash' in u)));
@@ -110,6 +129,45 @@ test('Auto Safety Report end-to-end API and persistence', { timeout: 120000 }, a
       assert.equal(retry.status,200);assert.equal(retry.body.report.createdAt,safe.body.report.createdAt);
       assert.equal(await db.collection('safety_reports').countDocuments(),2);
     });
+    await t.test('injury taps save independently, sync live, support multiple choices, and survive restart', async () => {
+      const route='/api/reports/mine/injuries';
+      assert.equal((await request('anonymous',route,'PATCH',{injury:'bleeding',selected:true})).status,401);
+      for(const actor of ['admin','superadmin']) assert.equal((await request(actor,route,'PATCH',{injury:'bleeding',selected:true})).status,403);
+      assert.equal((await request('resident',route,'PATCH',{injury:'bleeding',selected:true})).status,409);
+      await logIn('unreported','A-301');assert.equal((await request('unreported',route,'PATCH',{injury:'bleeding',selected:true})).status,409);
+      for(const body of [{},{injury:'unknown',selected:true},{injury:'bleeding',selected:'yes'},{injury:{$ne:null},selected:true},{completeStep:true,injury:'bleeding'},{injuries:['bleeding']}]) assert.equal((await request('resident2',route,'PATCH',body)).status,400);
+      const before=(await request('resident2','/api/reports/mine')).body.report;assert.deepEqual(before.injuries,[]);assert.equal(before.injuryStepCompletedAt,null);
+      const stream=await fetch(base+'/api/map/events',{headers:{Cookie:cookies.get('admin')}}),reader=stream.body.getReader();await reader.read();
+      try {
+        const first=await request('resident2',route,'PATCH',{injury:'bleeding',selected:true,userId:'A-201',building:0});
+        assert.equal(first.status,200);assert.equal(first.body.report.username,'B-302');assert.equal(first.body.report.building,1);assert.equal(first.body.report.detailsSubmittedAt,null);
+        assert.deepEqual(first.body.report.injuries,['bleeding']);assert.equal(first.body.report.revision,before.revision+1);
+        const event=await Promise.race([reader.read(),new Promise((_,reject)=>setTimeout(()=>reject(new Error('Report event missing')),2000))]);assert.ok(new TextDecoder().decode(event.value).includes('event: reports'));
+        const raw=await db.collection('safety_reports').findOne({_id:first.body.report._id});assert.deepEqual(raw.injuries,['bleeding']);assert.equal(raw.situation,'');
+        const retry=await request('resident2',route,'PATCH',{injury:'bleeding',selected:true});assert.equal(retry.body.report.revision,first.body.report.revision);
+        const concurrent=await Promise.all(['fracture','smoke_inhalation'].map(injury=>request('resident2',route,'PATCH',{injury,selected:true})));assert.ok(concurrent.every(r=>r.status===200));
+        for(const selected of [true,false]) assert.equal((await request('resident2',route,'PATCH',{injury:'burns',selected})).status,200);
+        const current=(await request('resident2','/api/reports/mine')).body.report;assert.deepEqual(current.injuries.sort(),['bleeding','fracture','smoke_inhalation']);
+        const counts={bleeding:1,fracture:1,burns:0,smoke_inhalation:1};
+        assert.deepEqual((await request('admin','/api/dashboard')).body.injuryCounts,counts);
+        assert.deepEqual((await request('superadmin','/api/dashboard?building=1')).body.injuryCounts,counts);
+        assert.deepEqual((await request('admin','/api/dashboard?building=0')).body.injuryCounts,{bleeding:0,fracture:0,burns:0,smoke_inhalation:0});
+        assert.deepEqual((await request('admin','/api/dashboard')).body.counts,{safe:1,help:1,none:16});
+        const next=await request('resident2',route,'PATCH',{completeStep:true});assert.equal(next.status,200);assert.ok(next.body.report.injuryStepCompletedAt);assert.equal(next.body.report.detailsSubmittedAt,null);
+        assert.equal((await request('resident2',route,'PATCH',{completeStep:true})).body.report.injuryStepCompletedAt,next.body.report.injuryStepCompletedAt);
+      } finally {await reader.cancel();}
+      await new Promise(resolve=>server.close(resolve));await initializeDatabase(rawDb);await startHttp(db);
+      await logIn('resident','A-201');await logIn('resident2','B-302');await logIn('admin');await logIn('superadmin');
+      const persisted=(await request('resident2','/api/reports/mine')).body.report;assert.deepEqual(persisted.injuries.sort(),['bleeding','fracture','smoke_inhalation']);assert.ok(persisted.injuryStepCompletedAt);assert.equal(persisted.detailsSubmittedAt,null);
+      // A help report from the previous release has no injury fields.
+      await logIn('legacyPending','A-301');await request('legacyPending','/api/reports','POST',{status:'help'});
+      const legacy=(await request('legacyPending','/api/reports/mine')).body.report;
+      await db.collection('safety_reports').updateOne({_id:legacy._id},{$unset:{injuries:'',injuryStepCompletedAt:'',revision:''}});
+      const upgraded=await request('legacyPending',route,'PATCH',{injury:'burns',selected:true});assert.equal(upgraded.status,200);assert.deepEqual(upgraded.body.report.injuries,['burns']);assert.equal(upgraded.body.report.revision,1);
+      await request('legacyPending',route,'PATCH',{injury:'burns',selected:false});
+      const skipped=await request('legacyPending',route,'PATCH',{completeStep:true});assert.equal(skipped.status,200);assert.deepEqual(skipped.body.report.injuries,[]);
+      await db.collection('safety_reports').deleteOne({_id:legacy._id});
+    });
     await t.test('optional details finalize the signed-in report without changing status or counts', async () => {
       assert.equal((await request('admin','/api/reports/mine','PATCH',{})).status,403);
       assert.equal((await request('resident2','/api/reports/mine','PATCH',{status:'safe'})).status,400);
@@ -122,10 +180,14 @@ test('Auto Safety Report end-to-end API and persistence', { timeout: 120000 }, a
       assert.equal((await request('resident','/api/reports/mine','PATCH',{familyPhone:'91234567'})).status,409);
       const help=await request('resident2','/api/reports/mine','PATCH',{situation:'Two people need assistance',location:'Building B stairwell',contact:'+852 9123 4567',userId:'A-201'});
       assert.equal(help.status,200);assert.equal(help.body.report.username,'B-302');assert.equal(help.body.report.status,'help');
+      assert.deepEqual(help.body.report.injuries.sort(),['bleeding','fracture','smoke_inhalation']);
+      assert.equal((await request('resident2','/api/reports/mine/injuries','PATCH',{injury:'burns',selected:true})).status,409);
+      assert.equal((await request('resident2','/api/reports/mine','PATCH',{injuries:['burns']})).status,400);
       assert.equal(help.body.report.contact,'+85291234567');assert.equal(help.body.report.location,'Building B stairwell');
       assert.equal((await request('resident2','/api/reports/mine','PATCH',{situation:'Changed'})).status,409);
       await logIn('blankHelp','A-101');
       assert.equal((await request('blankHelp','/api/reports','POST',{status:'help'})).status,201);
+      for(const injury of ['bleeding','burns']) assert.equal((await request('blankHelp','/api/reports/mine/injuries','PATCH',{injury,selected:true})).status,200);
       const submitted=await request('blankHelp','/api/reports/mine','PATCH',{});
       assert.equal(submitted.status,200);assert.ok(submitted.body.report.detailsSubmittedAt);
       for(const field of ['situation','location','contact']) assert.equal(submitted.body.report[field],'');
@@ -135,6 +197,8 @@ test('Auto Safety Report end-to-end API and persistence', { timeout: 120000 }, a
       assert.equal(withPhone.status,200);assert.equal(withPhone.body.report.familyPhone,'+85292345678');assert.equal(withPhone.body.report.notificationStatus,'disabled');
       assert.deepEqual((await request('admin','/api/dashboard')).body.counts,{safe:2,help:2,none:14});
       assert.equal(await db.collection('safety_reports').countDocuments(),4);
+      assert.deepEqual((await request('admin','/api/dashboard')).body.injuryCounts,{bleeding:2,fracture:1,burns:1,smoke_inhalation:1});
+      assert.deepEqual((await request('admin','/api/dashboard?building=0')).body.injuryCounts,{bleeding:1,fracture:0,burns:1,smoke_inhalation:0});
     });
     await t.test('map autosave publishes updates, rejects conflicts, and filters block dashboards', async () => {
       const original=(await request('admin','/api/map')).body.map;
@@ -183,7 +247,7 @@ test('Auto Safety Report end-to-end API and persistence', { timeout: 120000 }, a
       for(const [path,body] of [['/api/floors/0/0',{status:'cleared',revision:0}],['/api/floors/0/4',{status:'cleared',revision:0}],['/api/floors/9/1',{status:'cleared',revision:0}],['/api/floors/0/1',{status:'inaccessible',revision:0}],['/api/floors/0/1',{status:'done',revision:0}],['/api/floors/0/1',{status:'cleared',revision:'0'}],['/api/floors/0/1',{status:'inaccessible',revision:0,note:'x'.repeat(301)}]]) assert.equal((await request('admin',path,'PATCH',body)).status,400);
       const stream=await fetch(base+'/api/map/events',{headers:{Cookie:cookies.get('superadmin')}});const reader=stream.body.getReader();await reader.read();let cleared;
       try {
-        cleared=await request('admin','/api/floors/0/1','PATCH',{status:'cleared',revision:0});assert.equal(cleared.status,200);assert.equal(cleared.body.floorSearch.updatedBy,'admin');
+        cleared=await request('admin','/api/floors/0/1','PATCH',{status:'cleared',revision:0});assert.equal(cleared.status,200);assert.equal(cleared.body.floorSearch.updatedBy,'admin1');
         const event=await Promise.race([reader.read(),new Promise((_,reject)=>setTimeout(()=>reject(new Error('Floor update event missing')),3000))]);assert.ok(new TextDecoder().decode(event.value).includes('event: floor-search'));
       } finally {await reader.cancel();}
       assert.equal((await request('superadmin','/api/floors/0/1','PATCH',{status:'cleared',revision:0})).status,200);
@@ -227,7 +291,7 @@ test('Auto Safety Report end-to-end API and persistence', { timeout: 120000 }, a
       assert.equal((await request('resident','/api/auth/me')).status,401);
       assert.equal((await request('resident','/api/auth/login','POST',{username:'A-201',password:'A-201'})).status,401);
       for(const name of ['incidents','safety_reports','found_items']) assert.equal(await db.collection(name).countDocuments(),0);
-      assert.equal(await db.collection('users').countDocuments(),2);
+      assert.equal(await db.collection('users').countDocuments(),4);
       assert.equal((await request('admin','/api/auth/me')).status,401);assert.equal((await request('superadmin','/api/auth/me')).status,200);
       assert.equal(await db.collection('disaster_maps').countDocuments(),0);assert.equal(await db.collection('floor_searches').countDocuments(),0);
     });
@@ -239,7 +303,7 @@ test('Auto Safety Report end-to-end API and persistence', { timeout: 120000 }, a
         await db.collection('users').insertOne({_id:'temporary-unit',incidentId:'interrupted'});
         await db.collection('found_items').insertOne({_id:'temporary-item',incidentId:'interrupted'});
         await initializeDatabase(rawDb);
-        assert.equal(await db.collection('incidents').countDocuments(),0);assert.equal(await db.collection('found_items').countDocuments(),0);assert.equal(await db.collection('users').countDocuments(),2);
+        assert.equal(await db.collection('incidents').countDocuments(),0);assert.equal(await db.collection('found_items').countDocuments(),0);assert.equal(await db.collection('users').countDocuments(),4);
         if(status==='provisioning') { const draft=await db.collection('disaster_maps').findOne({_id:'current'});assert.equal(draft.phase,'draft');assert.equal(draft.incidentId,null); } else assert.equal(await db.collection('disaster_maps').countDocuments(),0);
       }
       const map=await setupMap([{building:0,label:'Block A',floors:2,rooms:1}],'Next disaster');
@@ -255,7 +319,7 @@ test('Auto Safety Report end-to-end API and persistence', { timeout: 120000 }, a
         const cookie=response.headers.get('set-cookie');if(cookie)sessions.set(actor,cookie.split(';')[0]);
         return {status:response.status,body:await response.json()};
       }
-      const login=async username=>assert.equal((await call(username,'/auth/login','POST',{username,password:username})).status,200);
+      const login=async actor=>{const username=['admin','superadmin'].includes(actor)?actor+'1':actor;assert.equal((await call(actor,'/auth/login','POST',{username,password:username})).status,200);};
       try {
         await login('superadmin');
         const uploaded=await call('superadmin','/map','POST',{image:png});
@@ -331,8 +395,8 @@ test('Auto Safety Report end-to-end API and persistence', { timeout: 120000 }, a
       const legacyServer=createApp(store,{rateLimits:false}).listen(0,'127.0.0.1');await once(legacyServer,'listening');const legacyBase=`http://127.0.0.1:${legacyServer.address().port}/api`;let cookie;
       async function legacy(route,method='GET',body) {const response=await fetch(legacyBase+route,{method,headers:{'Content-Type':'application/json',...(cookie?{Cookie:cookie}:{})},...(body?{body:JSON.stringify(body)}:{})});const set=response.headers.get('set-cookie');if(set)cookie=set.split(';')[0];return {status:response.status,body:await response.json()};}
       try {
-        assert.equal((await legacy('/auth/login','POST',{username:'admin',password:'admin'})).status,403);
-        assert.equal((await legacy('/auth/login','POST',{username:'superadmin',password:'superadmin'})).status,200);
+        assert.equal((await legacy('/auth/login','POST',{username:'admin1',password:'admin1'})).status,403);
+        assert.equal((await legacy('/auth/login','POST',{username:'superadmin1',password:'superadmin1'})).status,200);
         const uploaded=await legacy('/map','POST',{image:png});assert.equal(uploaded.status,201);assert.equal(uploaded.body.map.blocks[0].floors,2);
         const saved=await legacy('/map','PATCH',{...uploaded.body.map,annotations:[{id:'legacy-marker',type:'block',building:0,x:.5,y:.5}]});assert.equal(saved.status,200);
         const initialized=await legacy('/incident','POST',{mapRevision:saved.body.map.revision});assert.equal(initialized.status,201);assert.equal(initialized.body.preserved,true);
@@ -341,22 +405,22 @@ test('Auto Safety Report end-to-end API and persistence', { timeout: 120000 }, a
         assert.equal((await legacy('/reports/mine')).body.report.status,'safe');
       } finally {await new Promise(resolve=>legacyServer.close(resolve));}
     });
-    await t.test('database keeps six data collections and never creates sessions after login or startup', async () => {
+    await t.test('database keeps the system data collections and never creates sessions after login or startup', async () => {
       assert.deepEqual((await rawDb.listCollections({}, {nameOnly:true}).toArray()).map(c=>c.name).sort(),Object.values(COLLECTION_NAMES).sort());
-      const manager=await rawDb.collection('user').findOne({_id:'admin'});
+      const manager=await rawDb.collection('user').findOne({_id:'admin1'});
       assert.equal(manager.role,'admin');assert.equal(manager.recordType,undefined);
       const scopeDb=client.db('separate_record_scope');
       const scoped=await initializeDatabase(scopeDb);
       await scoped.collection('found_items').insertOne({_id:'admin',description:'Same ID, different collection'});
-      assert.equal((await scoped.collection('users').findOne({_id:'admin'})).role,'admin');
+      assert.equal((await scoped.collection('users').findOne({_id:'admin1'})).role,'admin');
       assert.equal((await scoped.collection('found_items').findOne({_id:'admin'})).description,'Same ID, different collection');
       assert.throws(()=>scoped.collection('sessions'),/Unknown system record group/);
       await initializeDatabase(scopeDb);
       assert.deepEqual((await scopeDb.listCollections({}, {nameOnly:true}).toArray()).map(c=>c.name).sort(),Object.values(COLLECTION_NAMES).sort());
-      assert.equal(await scoped.collection('users').countDocuments(),2);
+      assert.equal(await scoped.collection('users').countDocuments(),4);
       assert.equal(await scoped.collection('found_items').countDocuments(),1);
       await scoped.collection('found_items').deleteMany({});
-      assert.equal(await scoped.collection('users').countDocuments(),2);
+      assert.equal(await scoped.collection('users').countDocuments(),4);
     });
     await t.test('migration preserves IDs, relationships, hashes, photos, and the source; reruns refuse conflicts', async () => {
       const migrationDb=client.db('migration_scope');

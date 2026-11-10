@@ -12,7 +12,50 @@
 .map-block-frame{max-width:100%;width:max-content}.map-block-frame .map-block{width:100%;height:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.map-block-frame.sized-block .map-block{min-height:0;min-width:0;padding:2px 5px;border-radius:12px}.block-resize-handle{position:absolute;right:-7px;bottom:-7px;z-index:3;width:17px;height:17px;min-height:17px;padding:0;border:2px solid white;border-radius:3px;background:#1965cf;cursor:nwse-resize;box-shadow:0 0 0 1px #1965cf}.block-size-controls{border-top:1px solid var(--line);padding-top:14px;margin-bottom:17px}.block-size-controls .field{margin-bottom:11px}
 
 .map-block-frame.selected-frame{z-index:4}
+.map-save-hint{margin:-8px 0 17px}
+.map-refresh { display: flex; flex-wrap: wrap; gap: 10px; }
+.whatsapp-sender {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: white;
+  font-size: 13px;
+  font-weight: 400;
+  text-align: left;
+}
+.whatsapp-sender.connected:disabled { opacity: 1; cursor: default; }
+.whatsapp-sender-details { display: grid; gap: 2px; }
+.whatsapp-sender-details > span { color: var(--sub); font-size: 11px; }
+.whatsapp-sender-dot {
+  width: 10px;
+  height: 10px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--red);
+}
+.whatsapp-sender.connected .whatsapp-sender-dot { background: var(--green); }
 
 .shell{overflow:clip}.app-body>main{min-width:0}.search-summary{grid-template-columns:repeat(4,minmax(0,1fr))}.floor-progress strong small{font-size:16px;font-weight:500;color:var(--sub)}.floor-progress>small{display:block;font-size:10px;color:var(--sub);margin-top:5px}.floor-progress progress{display:block;width:100%;height:7px;margin-top:9px;accent-color:#425568}.swatch.searched{background:#425568}.swatch.inaccessible{background:#d89d22}.floor-control{padding:9px 5px;gap:5px;flex-direction:column;min-height:84px;white-space:normal}.floor-control strong{font-size:13px}.floor-control.searched{background:#425568;color:white}.floor-control.inaccessible{background:#fff3d1;color:#79580d;border:1px solid #e4b651}.floor-badge{font-size:10px;font-weight:650}.floor-actions{display:flex;gap:4px;justify-content:center;flex-wrap:wrap}.floor-actions button{min-height:29px;padding:4px 6px;font-size:10px;border-radius:6px}.floor-control.searched .floor-actions button:disabled{background:#ffffff25;border-color:#ffffff55;color:white;opacity:1}.floor-note{font-size:10px;font-weight:400;line-height:1.4;max-width:135px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}.unit-cell.searched.safe{background:#477568;border-color:#477568}.unit-cell.searched.help{background:#986266;border-color:#986266}.unit-cell.searched.none{background:#cbd3da;border-color:#b4c0cb;color:#334b5c}.unit-cell.inaccessible{box-shadow:inset 0 0 0 2px #d89d22}.map-modal .actions{margin-top:18px}
 @media(min-width:900px){.app-body.with-navigation{display:grid;grid-template-columns:180px minmax(0,1fr);align-items:start;background:linear-gradient(to right,white 180px,#edf3f7 180px)}.app-body.with-navigation>main{grid-column:2;grid-row:1;padding:26px}.app-body.with-navigation>.bottom-nav{grid-column:1;grid-row:1;align-self:start;position:sticky;top:12px;bottom:auto;flex-direction:column;gap:9px;border-top:0;border-right:1px solid var(--line);padding:20px 10px;min-height:calc(100vh - 190px);justify-content:flex-start}.app-body.with-navigation>.bottom-nav button{flex:0 0 auto;justify-content:flex-start;min-height:58px;padding:14px 10px;border-radius:10px;font-size:13px;text-align:left}.app-body.with-navigation>.bottom-nav button.selected{box-shadow:inset 3px 0 0 var(--teal)}.app-body.with-navigation>.bottom-nav svg{flex-shrink:0}}
 @media(max-width:899px){.search-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.app-body>.bottom-nav{position:sticky;bottom:0}}
+
+/* Injury selection and responder summaries share the same four pictograms. */
+.sr-only{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important}
+.injury-icon{display:block;width:64px;height:64px;flex-shrink:0}
+.injury-choices{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:20px 0}
+.injury-choice{position:relative;display:flex;flex-direction:column;min-height:190px;gap:7px;padding:17px 10px;background:#fff;border:2px solid #d7e2e9;border-radius:15px;color:#19394d;text-align:center}
+.injury-choice:hover{border-color:#6d9dab;background:#f7fbfc}.injury-choice.selected{border-color:#0c6b82;background:#eaf6f8;box-shadow:inset 0 0 0 1px #0c6b82}
+.injury-choice .injury-icon{width:78px;height:78px}.injury-choice strong{font-size:16px;line-height:1.3}.injury-choice small{font-size:13px;color:#526c7c;font-weight:400}
+.injury-choice-state{display:flex;gap:5px;align-items:center;justify-content:center;font-size:12px;min-height:22px;color:#557181}.injury-choice.selected .injury-choice-state{color:#0a637c;font-weight:650}
+.injury-save-state{font-size:13px;min-height:24px;margin-bottom:15px;color:#0a637c}.injury-emergency-call{display:flex;margin-top:16px;min-height:42px;font-size:13px}
+.injury-badges{display:inline-flex;align-items:center;justify-content:center;gap:4px;flex-wrap:wrap;vertical-align:middle}.injury-badge{display:inline-flex;align-items:center;justify-content:center;border:1px solid #d5e0e5;background:#fff;border-radius:7px;padding:1px;line-height:1.3;color:#19394d}.injury-badge .injury-icon{width:28px;height:28px}.injury-badges.with-labels{justify-content:flex-start;gap:7px}.injury-badges.with-labels .injury-badge{padding:3px 8px 3px 3px;gap:5px;font-size:12px;font-weight:500}.unit-cell>.injury-badges{margin-top:3px;padding:0 2px}.unit-cell .injury-badge{border-color:#ffffff99}.unit-cell .injury-icon{width:26px;height:26px}.help-list .injury-badges{flex:0 0 auto}.help-list .injury-badge{flex:0 0 auto}.selected-injury-summary{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;border-bottom:1px solid var(--line);padding-bottom:17px;margin-bottom:18px}.selected-injury-summary p{font-size:13px;margin:0}.selected-injury-summary>button{min-height:34px;padding:7px 10px;font-size:12px}.report-confirmation>.injury-badges{margin:12px auto;justify-content:center}
+.search-summary{grid-template-columns:repeat(3,minmax(0,1fr)) minmax(265px,1.8fr) minmax(135px,1fr)}.injury-metric{padding:14px}.injury-counts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 12px;margin-top:10px}.injury-count{display:grid;grid-template-columns:30px minmax(0,1fr) auto;gap:4px;align-items:center}.injury-count .injury-icon{width:30px;height:30px}.injury-count>span{font-size:10px;line-height:1.3;color:#36566b}.injury-count strong{font-size:22px;line-height:1;margin:0;color:#a23d44}.injury-metric>small{display:block;color:var(--sub);font-size:9px;line-height:1.4;margin-top:10px}
+@media(max-width:1150px){.search-summary{grid-template-columns:repeat(3,minmax(0,1fr))}.injury-metric{grid-column:span 2}}
+@media(max-width:600px){.search-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.search-summary>.metric:nth-child(3){grid-column:1/-1}.injury-metric{grid-column:1/-1}.search-summary>.floor-progress{grid-column:1/-1}.injury-count>span{font-size:11px}.injury-counts{gap:12px}.injury-choices{gap:10px}.injury-choice{min-height:177px;padding:12px 7px}.injury-choice .injury-icon{width:68px;height:68px}.injury-choice strong{font-size:14px}.injury-choice small{font-size:12px}}
+
+.injury-description{font-size:12px;line-height:1.45;font-weight:400;color:#526c7c;max-width:230px}.injury-choice-state{margin-top:auto}
+
+.whatsapp-link-card{text-align:center}.whatsapp-link-card>.page-icon{margin:0 auto 16px}.whatsapp-link-card .actions{justify-content:center;margin-top:20px}.whatsapp-link-card>.hint{text-align:left}.whatsapp-qr{display:block;width:100%;max-width:310px;height:auto;aspect-ratio:1;margin:20px auto;border:1px solid var(--line);border-radius:12px;padding:10px;background:white}.whatsapp-qr-placeholder{min-height:250px;display:flex;align-items:center;justify-content:center;color:var(--sub);border:1px dashed var(--line);border-radius:12px;padding:25px;margin:20px 0}.whatsapp-setup>.clear-button{margin-top:20px}

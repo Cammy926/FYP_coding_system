@@ -12,3 +12,5 @@ backend/.backups/
 data/
 logs/
 runtime/
+.wwebjs_auth/
+.wwebjs_cache/

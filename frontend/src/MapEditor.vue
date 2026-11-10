@@ -10,6 +10,7 @@ const color = ref('#ed2024'), width = ref(4), selected = ref(null), preview = re
 const blockSize = ref(null);
 const modal = ref(null), history = ref([]), pending = ref(null);
 const layoutLocked = computed(() => model.value.phase === 'active' || !!model.value.incidentId);
+const manualSave = computed(() => model.value.phase === 'active');
 const chosen = computed(() => model.value.annotations.find(a => a.id === selected.value));
 const canDelete = computed(() => chosen.value && !(layoutLocked.value && chosen.value.type === 'block'));
 const unplaced = computed(() => model.value.blocks.filter(b => !model.value.annotations.some(a => a.type === 'block' && a.building === b.building)));
@@ -17,12 +18,17 @@ const modalPrefix = computed(() => modal.value ? codeFromLabel(modal.value.label
 const ready = computed(() => model.value.blocks.length > 0 && !unplaced.value.length && !pending.value && !saving.value && !error.value && !modal.value);
 let timeout, running, gesture, placing = null, alive = true;
 const fields = () => copy({ name: model.value.name, blocks: model.value.blocks, annotations: model.value.annotations });
+let savedSnapshot = JSON.stringify(fields());
 const dirty = () => emit('dirty', !!pending.value || saving.value || !!error.value);
 function remember() { history.value.push(fields()); if (history.value.length > 25) history.value.shift(); }
-function changed() { pending.value = fields(); clearTimeout(timeout); error.value = ''; dirty(); timeout = setTimeout(() => flush(), 300); }
+function updatePending() { const snapshot = fields();pending.value = JSON.stringify(snapshot) === savedSnapshot ? null : snapshot; }
+function changed() {
+  updatePending();clearTimeout(timeout);error.value = '';dirty();
+  if (!manualSave.value && pending.value) timeout = setTimeout(() => flush(), 300);
+}
 async function flush() {
   clearTimeout(timeout);
-  if (running) { await running; if (pending.value && !error.value) return flush(); return !error.value; }
+  if (running) { await running; if (!manualSave.value && pending.value && !error.value) return flush(); return !error.value; }
   if (!pending.value) return !error.value;
   running = (async () => {
     saving.value = true; dirty();
@@ -31,15 +37,20 @@ async function flush() {
         const snapshot = pending.value; pending.value = null;
         try {
           const saved = await props.save({ ...snapshot, revision: revision.value });
-          revision.value = saved.revision; emit('saved', saved);
+          revision.value = saved.revision;savedSnapshot = JSON.stringify(snapshot);updatePending();emit('saved', saved);
         } catch (failure) { if (!pending.value) pending.value = snapshot; error.value = failure.message; break; }
+        // Save publishes only the snapshot requested by that click. Any edit
+        // made while the request is in flight needs another explicit Save.
+        if (manualSave.value) break;
       }
     } finally { saving.value = false; dirty(); }
   })();
   await running; running = null; return !error.value;
 }
+async function saveChanges() { error.value = '';return flush(); }
 async function initialize() { if (await flush()) emit('initialize', revision.value); }
-async function exit() { if (await flush()) emit('exit'); }
+async function prepareToLeave() { if (running) await running;return manualSave.value ? true : flush(); }
+async function exit() { if (await prepareToLeave()) emit('exit'); }
 function undo() { if (!history.value.length) return; Object.assign(model.value, history.value.pop()); selected.value = null; changed(); }
 function removeSelected() {
   if (!canDelete.value) return;
@@ -153,12 +164,13 @@ function beforeUnload(event) { if (pending.value || saving.value) { event.preven
 function keydown(event) { if ((event.key === 'Delete' || event.key === 'Backspace') && !/INPUT|TEXTAREA|SELECT/.test(event.target.tagName) && !modal.value) { event.preventDefault(); removeSelected(); } }
 onMounted(() => { window.addEventListener('beforeunload', beforeUnload); window.addEventListener('keydown', keydown); });
 onBeforeUnmount(() => { alive = false; clearTimeout(timeout); window.removeEventListener('beforeunload', beforeUnload); window.removeEventListener('keydown', keydown); });
-defineExpose({ flush });
+defineExpose({ prepareToLeave });
 </script>
 <template>
   <section class="map-editor">
-    <div class="page-head"><div><span class="eyebrow">Super Admin · Disaster map editor</span><h2>{{ model.phase === 'active' ? 'Edit disaster map' : 'Set up the disaster area' }}</h2><p>Place each building label, then add boundaries, notes, and emoji.</p></div><div class="actions"><span class="save-state" role="status">{{ error ? 'Changes not saved' : saving || pending ? 'Saving…' : 'All changes saved' }}</span><button v-if="model.phase === 'active'" :disabled="!!error || initializing" @click="exit">View disaster map</button><button v-else class="primary" :disabled="!ready || initializing" @click="initialize">{{ initializing ? 'Initializing…' : 'Initialize' }}</button></div></div>
-    <div v-if="error" class="message error" role="alert"><span>{{ error }}</span><button @click="error=''; flush()">Retry save</button><button @click="emit('reload')">Reload saved map</button></div>
+    <div class="page-head"><div><span class="eyebrow">Super Admin · Disaster map editor</span><h2>{{ model.phase === 'active' ? 'Edit disaster map' : 'Set up the disaster area' }}</h2><p>{{ manualSave ? 'Edit boundaries, labels, notes, and emoji. Click Save to update the disaster map.' : 'Place each building label, then add boundaries, notes, and emoji.' }}</p></div><div class="actions"><span class="save-state" role="status">{{ error ? 'Changes not saved' : saving ? 'Saving…' : pending ? manualSave ? 'Unsaved changes' : 'Saving…' : 'All changes saved' }}</span><template v-if="model.phase === 'active'"><button class="primary" :disabled="!pending || saving || initializing || !!modal" @click="saveChanges">{{ saving ? 'Saving…' : 'Save' }}</button><button :disabled="saving || initializing" @click="exit">View disaster map</button></template><button v-else class="primary" :disabled="!ready || initializing" @click="initialize">{{ initializing ? 'Initializing…' : 'Initialize' }}</button></div></div>
+    <p v-if="manualSave" class="hint map-save-hint">Changes stay in this editor until you click Save. Leaving without saving discards them.</p>
+    <div v-if="error" class="message error" role="alert"><span>{{ error }}</span><button @click="saveChanges">Retry save</button><button @click="emit('reload')">Reload saved map</button></div>
     <div class="map-toolbar" aria-label="Map drawing tools">
       <button v-for="entry in [['select','Select / move'],['pen','Pen'],['rectangle','Boundary'],['block','Building block'],['text','Text / emoji']]" :key="entry[0]" :class="{ active: tool === entry[0] }" :aria-pressed="tool === entry[0]" :disabled="initializing" @click="tool=entry[0]; selected=null">{{ entry[1] }}</button>
       <label class="tool-color">Color<input v-model="color" aria-label="Drawing color" type="color"></label><label class="tool-width">Width<input v-model.number="width" aria-label="Pen width" type="number" min="1" max="12"></label>
@@ -166,7 +178,7 @@ defineExpose({ flush });
     </div>
     <p class="map-instruction">{{ tool === 'block' ? 'Click the map to place a building label and set its floors and units.' : tool === 'text' ? 'Click the map to add a note or emoji.' : tool === 'select' ? 'Drag a selected label to move it. Drag its corner handle, or use Block size, to resize it.' : 'Drag on the map to draw.' }}</p>
     <div class="map-workspace"><FloorPlan :map="model" editable :tool="tool" :selected="selected" :preview="preview" @start="start" @move="move" @end="end" @cancel="cancel" @resize-key="resizeKey"/>
-      <aside class="card block-settings"><label class="field"><span>Disaster name</span><input v-model="model.name" maxlength="100" required :disabled="initializing" @change="remember(); changed()"></label><section v-if="chosen?.type === 'block'" class="block-size-controls" aria-label="Selected block size"><h3>Block size</h3><label class="field"><span>Block width (% of map)</span><input type="number" min="4" max="100" step="0.1" :value="Math.round(currentBlockSize().w * 1000) / 10" :disabled="initializing" @change="resizeSelected('w', $event.target.value)"></label><label class="field"><span>Block height (% of map)</span><input type="number" min="3" max="100" step="0.1" :value="Math.round(currentBlockSize().h * 1000) / 10" :disabled="initializing" @change="resizeSelected('h', $event.target.value)"></label><label class="field"><span>Label font size (px)</span><input aria-label="Label font size (px)" aria-describedby="label-font-hint" type="number" min="8" max="72" step="1" :value="chosen.fontSize ?? ''" placeholder="Automatic" :disabled="initializing" @change="setLabelFontSize($event.target.value)"><small id="label-font-hint">8–72 px. Leave blank for automatic size. Enlarge the block if larger text needs more space.</small></label><p class="hint">Label and text sizes save automatically. Floor and unit counts stay the same.</p></section><h3>Building blocks</h3><p v-if="!model.blocks.length">Choose Building block, then click the map to add your first block.</p><div v-for="block in model.blocks" :key="block.building" class="block-setting"><strong>{{ block.label }}</strong><small>{{ block.floors }} floors · {{ block.rooms }} units per floor</small><button @click="editBlock(block)">{{ unplaced.some(b=>b.building===block.building) ? 'Place' : 'Edit' }} {{ block.label }}</button></div><p v-if="layoutLocked" class="hint">Existing accounts are preserved. Floor and unit counts and account prefixes are locked; label descriptions, positions, and other drawings can be edited.</p><p v-if="layoutLocked && chosen?.type === 'block'" class="hint">Move this building label instead of deleting it, so responders can still open the block.</p></aside></div>
+      <aside class="card block-settings"><label class="field"><span>Disaster name</span><input v-model="model.name" maxlength="100" required :disabled="initializing" @change="remember(); changed()"></label><section v-if="chosen?.type === 'block'" class="block-size-controls" aria-label="Selected block size"><h3>Block size</h3><label class="field"><span>Block width (% of map)</span><input type="number" min="4" max="100" step="0.1" :value="Math.round(currentBlockSize().w * 1000) / 10" :disabled="initializing" @change="resizeSelected('w', $event.target.value)"></label><label class="field"><span>Block height (% of map)</span><input type="number" min="3" max="100" step="0.1" :value="Math.round(currentBlockSize().h * 1000) / 10" :disabled="initializing" @change="resizeSelected('h', $event.target.value)"></label><label class="field"><span>Label font size (px)</span><input aria-label="Label font size (px)" aria-describedby="label-font-hint" type="number" min="8" max="72" step="1" :value="chosen.fontSize ?? ''" placeholder="Automatic" :disabled="initializing" @change="setLabelFontSize($event.target.value)"><small id="label-font-hint">8–72 px. Leave blank for automatic size. Enlarge the block if larger text needs more space.</small></label><p class="hint">{{ manualSave ? 'Click Save to publish label and text size changes.' : 'Label and text sizes save automatically.' }} Floor and unit counts stay the same.</p></section><h3>Building blocks</h3><p v-if="!model.blocks.length">Choose Building block, then click the map to add your first block.</p><div v-for="block in model.blocks" :key="block.building" class="block-setting"><strong>{{ block.label }}</strong><small>{{ block.floors }} floors · {{ block.rooms }} units per floor</small><button @click="editBlock(block)">{{ unplaced.some(b=>b.building===block.building) ? 'Place' : 'Edit' }} {{ block.label }}</button></div><p v-if="layoutLocked" class="hint">Existing accounts are preserved. Floor and unit counts and account prefixes are locked; label descriptions, positions, and other drawings can be edited.</p><p v-if="layoutLocked && chosen?.type === 'block'" class="hint">Move this building label instead of deleting it, so responders can still open the block.</p></aside></div>
     <div v-if="modal" class="map-modal-backdrop"><form class="card map-modal" role="dialog" aria-modal="true" :aria-label="modal.type === 'block' ? 'Configure building block' : 'Add map note'" @submit.prevent="confirmModal">
       <template v-if="modal.type === 'block'"><h3>Configure building block</h3><label class="field"><span>Block label</span><input v-model="modal.label" autofocus maxlength="60" required></label><label v-if="!codeFromLabel(modal.label) && !layoutLocked" class="field"><span>Account prefix</span><input v-model="modal.accountPrefix" maxlength="1" pattern="[A-Z]" required></label><p class="hint">Unit accounts: {{ blockUnitName({ accountPrefix: layoutLocked ? model.blocks[modal.building]?.accountPrefix : modalPrefix }, 1, 1) }}. The account prefix is fixed after initialization.</p><div class="fields"><label class="field"><span>Floors in this block</span><input v-model.number="modal.floors" type="number" min="1" max="40" required :disabled="layoutLocked"></label><label class="field"><span>Units per floor</span><input v-model.number="modal.rooms" type="number" min="1" max="20" required :disabled="layoutLocked"></label></div></template>
       <template v-else><h3>Add map note</h3><label class="field"><span>Text or emoji</span><input v-model="modal.text" maxlength="120" required></label><div class="emoji-tools"><button v-for="emoji in ['🚑','🚒','🚧','⚠️','🆘','🍔','🍟','💧']" :key="emoji" type="button" :aria-label="`Insert ${emoji}`" @click="modal.text += emoji">{{ emoji }}</button></div><label class="field"><span>Text size</span><input v-model.number="modal.fontSize" type="number" min="12" max="48" required></label></template>

@@ -1,5 +1,5 @@
 import { MongoClient } from 'mongodb';
-import { hashPassword } from './lib.js';
+import { seedManagerAccounts } from './manager-accounts.js';
 import { createStore, COLLECTION_NAMES } from './store.js';
 import { repairBlockAccounts } from './block-accounts.js';
 export const COLLECTIONS = Object.keys(COLLECTION_NAMES);
@@ -19,12 +19,11 @@ export async function initializeDatabase(db, passwords = {}) {
       try { await db.createCollection(name); } catch (e) { if (e.code !== 48) throw e; }
     }
   }
-  for (const name of ['users', 'safety_reports', 'found_items', 'floor_searches']) await store.collection(name).createIndex({ incidentId: 1 });
-  for (const role of ['superadmin', 'admin']) {
-    if (!await store.collection('users').findOne({ _id: role })) {
-      await store.collection('users').insertOne({ _id: role, username: role, role, passwordHash: await hashPassword(passwords[role] || role), createdAt: new Date() });
-    }
-  }
+  for (const name of ['users', 'safety_reports', 'found_items', 'floor_searches', 'whatsapp_replies']) await store.collection(name).createIndex({ incidentId: 1 });
+  // Cosmos DB requires an index on the queue's ordering field, even when the
+  // current query returns no pending records.
+  await store.collection('safety_reports').createIndex({ notificationRequestedAt: 1 });
+  await seedManagerAccounts(store, passwords);
   const incident = await store.collection('incidents').findOne({ _id: 'current' });
   // Recover interrupted multi-record operations before login opens: setup
   // rolls back, and an interrupted deletion finishes on the next launch.
@@ -37,6 +36,6 @@ export async function initializeDatabase(db, passwords = {}) {
 }
 export async function deleteIncidentData(db, incident) {
   const query = { incidentId: incident.incidentId };
-  for (const name of ['safety_reports', 'found_items', 'users', 'disaster_maps', 'floor_searches']) await db.collection(name).deleteMany(query);
+  for (const name of ['safety_reports', 'found_items', 'users', 'disaster_maps', 'floor_searches', 'whatsapp_replies']) await db.collection(name).deleteMany(query);
   await db.collection('incidents').deleteOne({ _id: 'current', incidentId: incident.incidentId });
 }

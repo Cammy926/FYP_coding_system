@@ -2,13 +2,25 @@
 import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue';
 import FloorPlan from './FloorPlan.vue';
 import MapEditor from './MapEditor.vue';
+import WhatsAppSetup from './WhatsAppSetup.vue';
+import WhatsAppInbox from './WhatsAppInbox.vue';
+import InjuryIcon from './InjuryIcon.vue';
+import InjuryBadges from './InjuryBadges.vue';
+import InjurySummary from './InjurySummary.vue';
+import { INJURY_TYPES, emptyInjuryCounts, reportInjuries } from '../../shared/injuries.js';
+import { notificationText, connectionText, safeConfirmationText } from '../../shared/notifications.js';
 import { blockUnitName } from '../../shared/blocks.js';
-import { ShieldCheck, LogOut, House, Search, CircleCheck, TriangleAlert, ArrowRight, ArrowLeft, Upload, RefreshCw, Download, PackageSearch, MapPin, Phone, Check, LockKeyhole } from 'lucide-vue-next';
+import { ShieldCheck, LogOut, House, Search, CircleCheck, TriangleAlert, ArrowRight, ArrowLeft, Upload, RefreshCw, Download, PackageSearch, MapPin, Phone, Check, LockKeyhole, Mail } from 'lucide-vue-next';
 
 const user = ref(null), incident = ref(null), screen = ref('login'), busy = ref(false), initializing = ref(true);
 const error = ref(''), notice = ref(''), online = ref(false), updated = ref(null);
 const reports = ref([]), myReport = ref(null), building = ref(0), selectedUnit = ref(null);
 const counts = reactive({ safe: 0, help: 0, none: 0 });
+const whatsapp = ref({ enabled: false, state: 'disabled' }), whatsappSetup = ref({ state: 'idle', qrAvailable: false, qrVersion: 0 });
+const whatsappSenderNumber = ref(null), whatsappReturn = ref('map');
+const whatsappConnected = computed(() => online.value && whatsapp.value.enabled && whatsapp.value.state === 'ready');
+const injuryCounts = reactive(emptyInjuryCounts()), editingInjuries = ref(false);
+const selectedInjuries = computed(() => reportInjuries(myReport.value));
 const floorSearches = ref([]), floorDraft = ref(null);
 const floorMap = computed(() => new Map(floorSearches.value.filter(f => f.building === building.value).map(f => [f.floor, f])));
 const floorStatus = floor => floorMap.value.get(floor)?.status || 'not_started';
@@ -30,19 +42,21 @@ const dashboardReady = ref(false);
 const mapData = ref(null), editor = ref(null), mapUnsaved = ref(false), editorKey = ref(0);
 const selectedBlock = computed(() => mapData.value?.blocks?.[building.value]);
 const safety = reactive({ familyPhone: '', situation: '', location: '', contact: '' });
-const reportStep = computed(() => !myReport.value ? 'choice' : myReport.value.detailsSubmittedAt === null ? 'details' : 'complete');
+const reportStep = computed(() => !myReport.value ? 'choice' : myReport.value.detailsSubmittedAt !== null ? 'complete' : myReport.value.status === 'help' && (!myReport.value.injuryStepCompletedAt || editingInjuries.value) ? 'injuries' : 'details');
 const displayDetail = value => typeof value === 'string' && value.trim() ? value : 'N/A';
 const found = reactive({ photo: '', description: '', place: '', category: '', contact: '' });
 const keyword = ref(''), items = ref([]), searched = ref(false), item = ref(null);
 const clearOpen = ref(false), confirmation = ref('');
 const manager = computed(() => user.value && user.value.role !== 'user');
 
+const inboxScreen = computed(() => screen.value === 'inbox' ||
+  (screen.value === 'whatsapp-setup' && whatsappReturn.value === 'inbox'));
 const lostScreen = computed(() => ['lost', 'found', 'items', 'detail'].includes(screen.value));
 const urgent = computed(() => reports.value.filter(r => r.status === 'help' && r.building === building.value).sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt)));
 const floorNumbers = computed(() => incident.value ? Array.from({ length: selectedBlock.value?.floors || 0 }, (_,i) => selectedBlock.value.floors - i) : []);
 const reportMap = computed(() => new Map(reports.value.map(r => [`${r.building}:${r.floor}:${r.room}`, r])));
 const categories = ['Toys', 'Documents', 'Electronics', 'Clothing', 'Other'];
-let timer, mapEvents, polling = false;
+let timer, mapEvents, polling = false, refreshSequence = 0;
 const formatTime = value => value ? new Date(value).toLocaleString('en-HK', { timeZone: 'Asia/Hong_Kong', dateStyle: 'medium', timeStyle: 'short' }) : '';
 const label = (b, f, r) => blockUnitName(mapData.value.blocks[b], f, r);
 const photoUrl = id => `/api/items/${encodeURIComponent(id)}/photo`;
@@ -59,9 +73,11 @@ async function api(path, options = {}) {
   return data;
 }
 function resetSession() {
+  refreshSequence++;editingInjuries.value = false;Object.assign(injuryCounts, emptyInjuryCounts());
   mapEvents?.close(); mapEvents = null; mapData.value = null; mapUnsaved.value = false;
   floorSearches.value = []; floorDraft.value = null;
   user.value = null; incident.value = null; reports.value = []; myReport.value = null; items.value = []; item.value = null;
+  whatsappSenderNumber.value = null; whatsappReturn.value = 'map';
   login.password = ''; safety.familyPhone = ''; safety.situation = ''; safety.location = ''; safety.contact = '';
   Object.assign(found, { photo: '', description: '', place: '', category: '', contact: '' });
   keyword.value = ''; searched.value = false; screen.value = 'login'; clearOpen.value = false; confirmation.value = ''; selectedUnit.value = null;
@@ -77,32 +93,51 @@ function watchMap() {
   mapEvents?.close(); mapEvents = null;
   if (!manager.value) return;
   mapEvents = new EventSource('/api/map/events');
-  const update = () => { if (screen.value !== 'map-editor' && !busy.value) refresh().catch(e => { if (e.status === 401) resetSession(); error.value = e.message; }); };
-  mapEvents.addEventListener('map', update);mapEvents.addEventListener('floor-search', update);
+  const update = event => { if (event?.type === 'whatsapp') api('/health').then(acceptHealth).catch(() => {}); if (screen.value !== 'map-editor' && !busy.value) refresh().catch(e => { if (e.status === 401) resetSession(); error.value = e.message; }); };
+  mapEvents.addEventListener('map', update);mapEvents.addEventListener('floor-search', update);mapEvents.addEventListener('reports', update);mapEvents.addEventListener('whatsapp', update);mapEvents.addEventListener('setup', update);
+}
+function acceptHealth(health) {
+  online.value = true;
+  whatsapp.value = health.whatsapp || { enabled: false, state: 'disabled' };
+  if (!whatsappConnected.value && notice.value === 'The WhatsApp sender is connected.') notice.value = '';
 }
 async function refresh() {
+  const sequence = ++refreshSequence;
   const current = user.value;
   if (!current) return;
   const data = await api('/incident');
-  if (user.value !== current) return;
+  if (user.value !== current || sequence !== refreshSequence) return;
   incident.value = data.incident;
+  whatsappSenderNumber.value = data.whatsappSenderNumber ?? null;
   if (manager.value) {
     if (screen.value === 'map-editor') return;
-    const result = await api('/map'); if (user.value !== current) return;
+    const result = await api('/map'); if (user.value !== current || sequence !== refreshSequence) return;
     const incoming = result.map, previous = mapData.value;
     if (!incoming || !previous || new Date(incoming.createdAt) > new Date(previous.createdAt) || (String(incoming.createdAt) === String(previous.createdAt) && incoming.revision >= previous.revision)) mapData.value = incoming;
     if (!mapData.value || mapData.value.phase !== 'active') {
       screen.value = mapData.value ? 'map-editor' : 'map-upload'; reports.value = []; clearOpen.value = false; return;
     }
+    if (user.value.role === 'superadmin' && (incident.value?.setupComplete === false || screen.value === 'whatsapp-setup')) {
+      let connection = await api('/whatsapp');
+      if (sequence !== refreshSequence || user.value !== current) return;
+      if (connection.state === 'idle') { await api('/whatsapp/connect', { method: 'POST', body: { incidentId: incident.value.incidentId } });connection = await api('/whatsapp'); }
+      if (sequence !== refreshSequence || user.value !== current) return;
+      whatsappSetup.value = connection;
+      if (!connection.setupComplete || connection.state !== 'ready') { screen.value = 'whatsapp-setup';reports.value = [];return; }
+      incident.value.setupComplete = true;
+      screen.value = whatsappReturn.value;
+      whatsappReturn.value = 'map';
+      notice.value = 'The WhatsApp sender is connected.';
+    }
     if (['map-upload','setup'].includes(screen.value)) screen.value = 'map';
     const selected = screen.value === 'dashboard' ? building.value : null;
     const dashboard = await api(`/dashboard${selected === null ? '' : '?building=' + selected}`);
-    if (user.value !== current || (screen.value === 'dashboard' && building.value !== selected)) return;
+    if (user.value !== current || sequence !== refreshSequence || (screen.value === 'dashboard' && building.value !== selected)) return;
     mergeFloorSearches(dashboard.floorSearches || []);
-    reports.value = dashboard.reports; Object.assign(counts, dashboard.counts); dashboardReady.value = true;
+    reports.value = dashboard.reports; Object.assign(counts, dashboard.counts); Object.assign(injuryCounts, emptyInjuryCounts(), dashboard.injuryCounts); dashboardReady.value = true;
     if (selectedUnit.value) selectedUnit.value = { ...selectedUnit.value, report: reportMap.value.get(`${selectedUnit.value.building}:${selectedUnit.value.floor}:${selectedUnit.value.room}`) };
   } else {
-    const result = await api('/reports/mine'); if (user.value !== current) return; acceptReport(result.report);
+    const result = await api('/reports/mine'); if (user.value !== current || sequence !== refreshSequence) return; acceptReport(result.report);
   }
   updated.value = new Date();
 }
@@ -132,21 +167,36 @@ async function signIn() {
   });
 }
 async function signOut() {
-  if (mapUnsaved.value && editor.value && !await editor.value.flush()) return;
+  if (mapUnsaved.value && editor.value && !await editor.value.prepareToLeave()) return;
   await task(async () => { await api('/auth/logout', { method: 'POST' }); resetSession(); notice.value = 'You have logged out.'; });
 }
+async function reconnectWhatsApp() {
+  await task(async () => { screen.value = 'whatsapp-setup';await api('/whatsapp/connect', { method: 'POST', body: { incidentId: incident.value.incidentId } });await refresh(); });
+}
+async function reconnectFromInbox(state) {
+  if (screen.value !== 'inbox' || user.value?.role !== 'superadmin' || busy.value) return;
+  whatsappReturn.value = 'inbox';
+  if (['starting', 'authenticated', 'qr_required'].includes(state)) {
+    screen.value = 'whatsapp-setup';
+    await task(refresh);
+  } else {
+    await reconnectWhatsApp();
+  }
+}
+function expireInbox(message) { resetSession(); error.value = message; }
 async function configure(revision) {
   await task(async () => {
     const data = await api('/incident', { method: 'POST', body: { mapRevision: revision } });
     incident.value = data.incident; screen.value = 'map'; mapUnsaved.value = false;
-    await refresh(); notice.value = data.preserved ? 'Disaster map initialized. Existing accounts and reports are preserved.' : `${data.count} unit accounts created. Click a block to review its safety reports.`;
+    await refresh(); notice.value = data.incident.setupComplete === false ? 'Map saved. Connect the WhatsApp sender to finish initialization.' : data.preserved ? 'Disaster map initialized. Existing accounts and reports are preserved.' : `${data.count} unit accounts created. Click a block to review its safety reports.`;
   });
 }
 async function clearSetup() {
   await task(async () => {
     await api('/incident', { method: 'DELETE', body: { confirmation: confirmation.value } });
     incident.value = null; reports.value = []; items.value = []; selectedUnit.value = null; clearOpen.value = false; confirmation.value = '';
-    mapData.value = null; floorSearches.value = []; floorDraft.value = null; screen.value = 'map-upload'; notice.value = 'Setup cleared. Upload a new disaster map.';
+    whatsappSenderNumber.value = null; whatsappReturn.value = 'map';
+    mapData.value = null; floorSearches.value = []; floorDraft.value = null; screen.value = 'map-upload'; whatsappSetup.value = { state: 'idle', qrAvailable: false, qrVersion: 0 };notice.value = 'Setup cleared and WhatsApp sender logged out. Upload a new disaster map.';
   });
 }
 function openFloor(floor) {
@@ -167,6 +217,7 @@ function clearFloor(floor) { return updateFloor({ incidentId: incident.value.inc
 function acceptReport(report) {
   // An older background poll must not undo a just-saved choice or completion.
   if (!report && myReport.value) return;
+  if (report?._id === myReport.value?._id && (report?.revision || 0) < (myReport.value?.revision || 0)) return;
   if (report?._id === myReport.value?._id && myReport.value && myReport.value.detailsSubmittedAt !== null && report.detailsSubmittedAt === null) return;
   const hydrate = report && (!myReport.value || myReport.value._id !== report._id);
   myReport.value = report;
@@ -181,6 +232,20 @@ async function chooseSafety(status) {
   });
   if (error.value && incident.value) await refresh().catch(() => {});
 }
+async function toggleInjury(injury) {
+  await task(async () => {
+    const data = await api('/reports/mine/injuries', { method: 'PATCH', keepalive: true, body: { injury, selected: !selectedInjuries.value.includes(injury) } });
+    acceptReport(data.report);
+  });
+  if (error.value && incident.value) await refresh().catch(() => {});
+}
+async function continueInjuries() {
+  await task(async () => {
+    const data = await api('/reports/mine/injuries', { method: 'PATCH', keepalive: true, body: { completeStep: true } });
+    acceptReport(data.report);editingInjuries.value = false;await focusReport();
+  });
+}
+async function changeInjuries() { editingInjuries.value = true;await focusReport(); }
 async function submitSafetyDetails() {
   await task(async () => {
     const data = await api('/reports/mine', { method: 'PATCH', body: { ...safety } });
@@ -190,7 +255,7 @@ async function submitSafetyDetails() {
   if (error.value && incident.value) await refresh().catch(() => {});
 }
 function selectUnit(floor, room) { selectedUnit.value = { building: building.value, floor, room, username: label(building.value,floor,room), report: reportMap.value.get(`${building.value}:${floor}:${room}`) }; }
-async function navigate(destination) { if (screen.value === 'map-editor' && editor.value && !await editor.value.flush()) return; screen.value = destination; floorDraft.value = null; error.value = ''; notice.value = ''; clearOpen.value = false; if (destination === 'map') await task(refresh); }
+async function navigate(destination) { if (screen.value === 'map-editor' && editor.value && !await editor.value.prepareToLeave()) return; screen.value = destination; whatsappReturn.value = 'map'; mapUnsaved.value = false; floorDraft.value = null; error.value = ''; notice.value = ''; clearOpen.value = false; if (destination === 'map') await task(refresh); }
 async function loadItems(search = false) {
   await task(async () => {
     if (search && !keyword.value.trim()) throw new Error('Enter a keyword to search.');
@@ -229,13 +294,13 @@ async function downloadAccounts() {
   });
 }
 onMounted(async () => {
-  try { await api('/health'); online.value = true; user.value = (await api('/auth/me')).user; screen.value = manager.value ? 'map' : 'resident'; await refresh(); watchMap(); }
+  try { acceptHealth(await api('/health')); user.value = (await api('/auth/me')).user; screen.value = manager.value ? 'map' : 'resident'; await refresh(); watchMap(); }
   catch (e) { if (e.status !== 401) error.value = e.message; }
   finally { initializing.value = false; }
   timer = setInterval(async () => {
     if (busy.value || polling || document.hidden) return;
     polling = true;
-    try { await api('/health'); online.value = true; if (user.value) await refresh(); }
+    try { acceptHealth(await api('/health')); if (user.value) await refresh(); }
     catch (e) { online.value = false; if (e.status === 401) { resetSession(); error.value = e.message; } else if (user.value) error.value = e.message; }
     finally { polling = false; }
   }, 5000);
@@ -249,8 +314,8 @@ onUnmounted(() => { clearInterval(timer); mapEvents?.close(); });
       <div class="brand"><div class="brand-mark"><ShieldCheck :size="25" /></div><div><strong>Auto Safety Report</strong><small>Emergency coordination · 報平安</small></div></div>
       <div class="top-actions"><span class="session-tag">{{ user ? manager ? `Responder · ${user.role === 'superadmin' ? 'Super Admin' : 'Admin'}` : `Resident · Unit ${user.username}` : 'Safety reporting + Lost & Found' }}</span><button v-if="user" class="logout" :disabled="busy" @click="signOut"><LogOut :size="16" />Log out</button></div>
     </header>
-    <div class="statusbar"><span><i class="connection-dot" :class="{ online }"></i>{{ online ? 'Database connected' : 'Connecting to backend' }}</span><span>Local development · Notifications & AI search deferred</span></div>
-    <div class="app-body" :class="{ 'with-navigation': user && incident }">
+    <div class="statusbar"><span><i class="connection-dot" :class="{ online }"></i>{{ online ? 'Database connected' : 'Connecting to backend' }}</span><span>{{ connectionText(whatsapp) }} · AI search deferred</span></div>
+    <div class="app-body" :class="{ 'with-navigation': user && incident && incident.setupComplete !== false }">
     <main :aria-busy="busy || initializing">
       <div v-if="error" class="message error" role="alert"><TriangleAlert :size="19"/><span>{{ error }}</span><button aria-label="Dismiss error" @click="error=''">×</button></div>
       <div v-if="notice" class="message success" role="status"><Check :size="19"/><span>{{ notice }}</span><button aria-label="Dismiss notice" @click="notice=''">×</button></div>
@@ -258,16 +323,42 @@ onUnmounted(() => { clearInterval(timer); mapEvents?.close(); });
 
       <section v-else-if="screen === 'login'" class="login-layout">
         <div class="hero"><div><span class="eyebrow">Community safety platform</span><h1>Know who is safe.<br>Find who needs help.</h1><p>A clear connection between residents and responders, when every update matters.</p></div><div class="hero-flow"><span><CircleCheck :size="18"/>Report safety or request help</span><span><House :size="18"/>Review unit status by location</span><span><PackageSearch :size="18"/>Reconnect lost items with owners</span></div></div>
-        <form class="card login-form" @submit.prevent="signIn"><span class="eyebrow">Welcome back</span><h2>Sign in</h2><p>Use your responder account or the account assigned to your unit.</p><label class="field"><span>Account name</span><input v-model="login.username" required maxlength="40" autocomplete="username" placeholder="e.g. 204 or A-204" :disabled="busy"></label><label class="field"><span>Password</span><input v-model="login.password" required maxlength="200" type="password" autocomplete="current-password" placeholder="Enter your password" :disabled="busy"></label><button class="primary full" :disabled="busy">{{ busy ? 'Signing in…' : 'Sign in' }}<ArrowRight :size="18"/></button><div class="hint"><LockKeyhole :size="15"/>Local test accounts: superadmin / superadmin · admin / admin. Only Super Admin can sign in before the disaster map is initialized.</div></form>
+        <form class="card login-form" @submit.prevent="signIn"><span class="eyebrow">Welcome back</span><h2>Sign in</h2><p>Use your responder account or the account assigned to your unit.</p><label class="field"><span>Account name</span><input v-model="login.username" required maxlength="40" autocomplete="username" placeholder="e.g. 204 or A-204" :disabled="busy"></label><label class="field"><span>Password</span><input v-model="login.password" required maxlength="200" type="password" autocomplete="current-password" placeholder="Enter your password" :disabled="busy"></label><button class="primary full" :disabled="busy">{{ busy ? 'Signing in…' : 'Sign in' }}<ArrowRight :size="18"/></button><div class="hint"><LockKeyhole :size="15"/>Local test accounts: superadmin1, superadmin2, admin1, admin2. Passwords match the account names. Only Super Admin can sign in before the disaster map is initialized.</div></form>
       </section>
 
       <section v-else-if="screen === 'map-upload' && user?.role === 'superadmin'" class="narrow">
         <div class="card map-upload"><span class="eyebrow">Super Admin · First step</span><h2>Upload the disaster area map</h2><p>Choose a PNG map. Next, label each building and add boundaries, notes, or emoji before initializing.</p><label class="map-upload-box"><Upload :size="42"/><strong>Choose a PNG map</strong><span>Up to 4 MB · PNG only</span><input aria-label="Disaster map PNG" type="file" accept="image/png" :disabled="busy" @change="uploadMap"></label><p v-if="incident" class="hint">Your existing unit accounts and safety reports will be preserved. Place labels for their building blocks to finish map setup.</p></div>
       </section>
       <MapEditor v-else-if="screen === 'map-editor' && mapData && user?.role === 'superadmin'" :key="editorKey" ref="editor" :map="mapData" :save="saveMap" :initializing="busy" @saved="mapData=$event" @dirty="mapUnsaved=$event" @initialize="configure" @exit="showMap" @reload="reloadMap"/>
+      <WhatsAppSetup v-else-if="screen === 'whatsapp-setup' && incident && user?.role === 'superadmin'" :connection="whatsappSetup" :incident="incident" :busy="busy" @refresh="task(refresh)" @connect="reconnectWhatsApp"/>
       <section v-else-if="screen === 'map' && mapData?.phase === 'active'">
-        <div class="page-head"><div><span class="eyebrow">Responder workspace · Disaster map</span><h2>{{ mapData.name }}</h2><p>Click a building block to see only that block’s emergency situation.</p></div><div class="actions"><button :disabled="busy" @click="task(refresh)"><RefreshCw :size="16"/>Refresh</button><button v-if="user.role === 'superadmin'" :disabled="busy" @click="editMap">Edit map</button><button v-if="user.role === 'superadmin'" class="clear-button" :disabled="busy" @click="clearOpen=!clearOpen; confirmation=''"><span>Clear Setup</span></button></div></div>
-        <div v-if="clearOpen" class="card clear-confirm"><h3>Delete this disaster’s data?</h3><p>This deletes its map, unit accounts, reports, and found items. Manager accounts remain.</p><form @submit.prevent="clearSetup"><label class="field"><span>Type CLEAR to confirm</span><input v-model="confirmation" autocomplete="off"></label><button class="danger" :disabled="busy || confirmation !== 'CLEAR'">Delete disaster data</button></form></div>
+        <div class="page-head">
+          <div><span class="eyebrow">Responder workspace · Disaster map</span><h2>{{ mapData.name }}</h2><p>Click a building block to see only that block’s emergency situation.</p></div>
+          <div class="actions">
+            <div class="map-refresh">
+              <button
+                v-if="user.role === 'superadmin' && whatsapp.enabled"
+                type="button"
+                class="whatsapp-sender"
+                :class="{ connected: whatsappConnected }"
+                :disabled="busy || whatsappConnected"
+                :title="whatsappConnected ? 'WhatsApp connected' : 'Click to reconnect WhatsApp'"
+                @click="reconnectWhatsApp"
+              >
+                <span class="whatsapp-sender-dot" aria-hidden="true"></span>
+                <span class="whatsapp-sender-details">
+                  <span>WhatsApp sender</span>
+                  <strong>{{ whatsappConnected ? whatsappSenderNumber || 'Number unavailable' : 'Not connected' }}</strong>
+                  <span class="sr-only">{{ whatsappConnected ? 'Connected' : 'Disconnected. Click to reconnect WhatsApp.' }}</span>
+                </span>
+              </button>
+              <button :disabled="busy" @click="task(refresh)"><RefreshCw :size="16"/>Refresh</button>
+            </div>
+            <button v-if="user.role === 'superadmin'" :disabled="busy" @click="editMap">Edit map</button>
+            <button v-if="user.role === 'superadmin'" class="clear-button" :disabled="busy" @click="clearOpen=!clearOpen; confirmation=''"><span>Clear Setup</span></button>
+          </div>
+        </div>
+        <div v-if="clearOpen" class="card clear-confirm"><h3>Delete this disaster’s data?</h3><p>This logs out the WhatsApp sender and deletes the map, unit accounts, reports, and found items. Manager accounts remain.</p><form @submit.prevent="clearSetup"><label class="field"><span>Type CLEAR to confirm</span><input v-model="confirmation" autocomplete="off"></label><button class="danger" :disabled="busy || confirmation !== 'CLEAR'">Delete disaster data</button></form></div>
         <FloorPlan :map="mapData" @open="openBlock"/><div class="map-block-links" aria-label="Building blocks"><button v-for="block in mapData.blocks" :key="block.building" :disabled="busy" @click="openBlock(block.building)">{{ block.label }} · {{ block.floors }} floors · {{ block.rooms }} units per floor<ArrowRight :size="16"/></button></div>
       </section>
       <section v-else-if="screen === 'dashboard' && incident && selectedBlock">
@@ -275,26 +366,34 @@ onUnmounted(() => { clearInterval(timer); mapEvents?.close(); });
         <div class="page-head"><div><span class="eyebrow">Responder workspace · Safety overview</span><h2>{{ selectedBlock.label }} · {{ mapData.name }}</h2><p>{{ selectedBlock.floors }} floors · {{ selectedBlock.rooms }} units per floor</p></div><div class="actions compact"><button :disabled="busy" @click="task(refresh)"><RefreshCw :size="16"/>Refresh</button><button :disabled="busy" @click="downloadAccounts"><Download :size="16"/>Unit accounts</button></div></div>
         <div v-if="clearOpen" class="card clear-confirm" role="region" aria-label="Confirm clear setup"><h3>Delete this disaster’s data?</h3><p>This permanently deletes its layout, unit accounts, safety reports, and found items. Admin and Super Admin accounts remain.</p><form @submit.prevent="clearSetup"><label class="field"><span>Type CLEAR to confirm</span><input v-model="confirmation" autocomplete="off" :disabled="busy"></label><div class="actions compact"><button class="danger" :disabled="busy || confirmation !== 'CLEAR'">{{ busy ? 'Clearing…' : 'Delete disaster data' }}</button><button type="button" :disabled="busy" @click="clearOpen=false">Cancel</button></div></form></div>
         <div v-if="!dashboardReady" class="card empty-state" role="status">Loading this block’s safety reports…</div><template v-else>
-        <div class="summary search-summary"><div class="metric help"><span>Needs help</span><strong>{{ counts.help }}</strong></div><div class="metric safe"><span>Reported safe</span><strong>{{ counts.safe }}</strong></div><div class="metric"><span>No response</span><strong>{{ counts.none }}</strong></div><div class="metric floor-progress" aria-label="Floor search progress"><span>Floors cleared</span><strong>{{ searchProgress.cleared }} <small>/ {{ searchProgress.total }}</small></strong><progress :max="searchProgress.total || 1" :value="searchProgress.cleared" aria-label="Floors searched"></progress><small>{{ searchProgress.inaccessible }} inaccessible · {{ searchProgress.pending }} pending</small></div></div>
-        <div class="priority"><h3><TriangleAlert :size="19"/>Urgent help requests · {{ selectedBlock.label }}</h3><p v-if="!urgent.length">No help requests reported for this building.</p><div v-else class="help-list"><button v-for="report in urgent" :key="report._id" @click="selectUnit(report.floor,report.room)"><strong>Unit {{ report.username }}</strong><span>{{ displayDetail(report.situation) }} · Location: {{ displayDetail(report.location) }}</span><ArrowRight :size="16"/></button></div></div>
-        <div class="card grid-panel"><div class="panel-head"><h3>Unit status by floor</h3><small>Refreshes every 5 seconds{{ updated ? ' · '+formatTime(updated) : '' }}</small></div><div class="legend"><span><i class="swatch safe"></i>Safe</span><span><i class="swatch help"></i>Needs help</span><span><i class="swatch none"></i>No response</span><span><i class="swatch searched"></i>Floor searched</span><span><i class="swatch inaccessible"></i>Floor inaccessible</span></div><div class="grid-scroll"><div class="unit-grid" :style="{ gridTemplateColumns: `150px repeat(${selectedBlock.rooms}, minmax(62px,1fr))`, minWidth: `${150+selectedBlock.rooms*67}px` }"><div class="grid-label">Floor</div><div v-for="r in selectedBlock.rooms" :key="'h'+r" class="grid-label">Room {{ String(r).padStart(2,'0') }}</div><template v-for="f in floorNumbers" :key="f"><div class="grid-label floor-label floor-control" :class="{ searched: floorStatus(f) === 'cleared', inaccessible: floorStatus(f) === 'inaccessible' }" :data-floor="f"><strong>{{ f }} / F</strong><span v-if="floorStatus(f) === 'cleared'" class="floor-badge">✓ Cleared</span><span v-else-if="floorStatus(f) === 'inaccessible'" class="floor-badge">⚠ Inaccessible</span><small v-if="floorMap.get(f)?.note" class="floor-note" :title="floorMap.get(f).note">{{ floorMap.get(f).note }}</small><div class="floor-actions"><button :aria-label="`Clear floor ${f}`" :disabled="busy || floorStatus(f) === 'cleared'" @click="clearFloor(f)">Clear</button><button :aria-label="`Edit search status for floor ${f}`" :disabled="busy" @click="openFloor(f)">Note / status</button></div></div><button v-for="r in selectedBlock.rooms" :key="`${f}:${r}`" class="unit-cell" :class="[reportMap.get(`${building}:${f}:${r}`)?.status || 'none', { searched: floorStatus(f) === 'cleared', inaccessible: floorStatus(f) === 'inaccessible' }]" :aria-label="`Unit ${label(building,f,r)}: ${statusText(reportMap.get(`${building}:${f}:${r}`)?.status)}`" @click="selectUnit(f,r)">{{ label(building,f,r) }}<span>{{ statusText(reportMap.get(`${building}:${f}:${r}`)?.status) }}</span></button></template></div></div>
-        <div v-if="selectedUnit" class="unit-detail" tabindex="0"><h3>Unit {{ selectedUnit.username }} · {{ statusText(selectedUnit.report?.status) }}</h3><template v-if="selectedUnit.report"><dl><template v-if="selectedUnit.report.status === 'help'"><dt>Situation</dt><dd>{{ displayDetail(selectedUnit.report.situation) }}</dd><dt>Current location</dt><dd>{{ displayDetail(selectedUnit.report.location) }}</dd><dt>Contact</dt><dd>{{ displayDetail(selectedUnit.report.contact) }}</dd></template><template v-else><dt>Family contact</dt><dd>{{ displayDetail(selectedUnit.report.familyPhone) }}</dd></template><dt>Reported</dt><dd>{{ formatTime(selectedUnit.report.createdAt) }} (HKT)</dd></dl></template><p v-else>No safety report has been submitted by this unit.</p></div></div><p class="footnote">Each account represents one unit. A report does not verify the safety of every person in the household. “Cleared” means the floor was searched; it does not change resident safe/help reports.</p></template>
+        <div class="summary search-summary"><div class="metric help"><span>Needs help</span><strong>{{ counts.help }}</strong></div><div class="metric safe"><span>Reported safe</span><strong>{{ counts.safe }}</strong></div><div class="metric"><span>No response</span><strong>{{ counts.none }}</strong></div><InjurySummary :counts="injuryCounts"/><div class="metric floor-progress" aria-label="Floor search progress"><span>Floors cleared</span><strong>{{ searchProgress.cleared }} <small>/ {{ searchProgress.total }}</small></strong><progress :max="searchProgress.total || 1" :value="searchProgress.cleared" aria-label="Floors searched"></progress><small>{{ searchProgress.inaccessible }} inaccessible · {{ searchProgress.pending }} pending</small></div></div>
+        <div class="priority"><h3><TriangleAlert :size="19"/>Urgent help requests · {{ selectedBlock.label }}</h3><p v-if="!urgent.length">No help requests reported for this building.</p><div v-else class="help-list"><button v-for="report in urgent" :key="report._id" @click="selectUnit(report.floor,report.room)"><strong>Unit {{ report.username }}</strong><InjuryBadges :injuries="reportInjuries(report)"/><span>{{ displayDetail(report.situation) }} · Location: {{ displayDetail(report.location) }}</span><ArrowRight :size="16"/></button></div></div>
+        <div class="card grid-panel"><div class="panel-head"><h3>Unit status by floor</h3><small>Refreshes every 5 seconds{{ updated ? ' · '+formatTime(updated) : '' }}</small></div><div class="legend"><span><i class="swatch safe"></i>Safe</span><span><i class="swatch help"></i>Needs help</span><span><i class="swatch none"></i>No response</span><span><i class="swatch searched"></i>Floor searched</span><span><i class="swatch inaccessible"></i>Floor inaccessible</span></div><div class="grid-scroll"><div class="unit-grid" :style="{ gridTemplateColumns: `150px repeat(${selectedBlock.rooms}, minmax(62px,1fr))`, minWidth: `${150+selectedBlock.rooms*67}px` }"><div class="grid-label">Floor</div><div v-for="r in selectedBlock.rooms" :key="'h'+r" class="grid-label">Room {{ String(r).padStart(2,'0') }}</div><template v-for="f in floorNumbers" :key="f"><div class="grid-label floor-label floor-control" :class="{ searched: floorStatus(f) === 'cleared', inaccessible: floorStatus(f) === 'inaccessible' }" :data-floor="f"><strong>{{ f }} / F</strong><span v-if="floorStatus(f) === 'cleared'" class="floor-badge">✓ Cleared</span><span v-else-if="floorStatus(f) === 'inaccessible'" class="floor-badge">⚠ Inaccessible</span><small v-if="floorMap.get(f)?.note" class="floor-note" :title="floorMap.get(f).note">{{ floorMap.get(f).note }}</small><div class="floor-actions"><button :aria-label="`Clear floor ${f}`" :disabled="busy || floorStatus(f) === 'cleared'" @click="clearFloor(f)">Clear</button><button :aria-label="`Edit search status for floor ${f}`" :disabled="busy" @click="openFloor(f)">Note / status</button></div></div><button v-for="r in selectedBlock.rooms" :key="`${f}:${r}`" class="unit-cell" :class="[reportMap.get(`${building}:${f}:${r}`)?.status || 'none', { searched: floorStatus(f) === 'cleared', inaccessible: floorStatus(f) === 'inaccessible' }]" :aria-label="`Unit ${label(building,f,r)}: ${statusText(reportMap.get(`${building}:${f}:${r}`)?.status)}`" :aria-describedby="reportInjuries(reportMap.get(`${building}:${f}:${r}`)).length ? `injuries-${building}-${f}-${r}` : undefined" @click="selectUnit(f,r)">{{ label(building,f,r) }}<span>{{ statusText(reportMap.get(`${building}:${f}:${r}`)?.status) }}</span><InjuryBadges :id="`injuries-${building}-${f}-${r}`" :injuries="reportInjuries(reportMap.get(`${building}:${f}:${r}`))"/></button></template></div></div>
+        <div v-if="selectedUnit" class="unit-detail" tabindex="0"><h3>Unit {{ selectedUnit.username }} · {{ statusText(selectedUnit.report?.status) }}</h3><template v-if="selectedUnit.report"><dl><template v-if="selectedUnit.report.status === 'help'"><dt>Reported injuries</dt><dd><InjuryBadges v-if="reportInjuries(selectedUnit.report).length" :injuries="reportInjuries(selectedUnit.report)" show-labels/><span v-else>N/A</span></dd><dt>Situation</dt><dd>{{ displayDetail(selectedUnit.report.situation) }}</dd><dt>Current location</dt><dd>{{ displayDetail(selectedUnit.report.location) }}</dd><dt>Contact</dt><dd>{{ displayDetail(selectedUnit.report.contact) }}</dd></template><template v-else><dt>Family contact</dt><dd>{{ displayDetail(selectedUnit.report.familyPhone) }}</dd><dt>WhatsApp notification</dt><dd>{{ notificationText(selectedUnit.report) }}<small v-if="selectedUnit.report.notificationSentAt"> · {{ formatTime(selectedUnit.report.notificationSentAt) }}</small></dd></template><dt>Reported</dt><dd>{{ formatTime(selectedUnit.report.createdAt) }} (HKT)</dd></dl></template><p v-else>No safety report has been submitted by this unit.</p></div></div><p class="footnote">Each account represents one unit. A report does not verify the safety of every person in the household. “Cleared” means the floor was searched; it does not change resident safe/help reports.</p></template>
       </section>
 
       <section v-else-if="screen === 'resident' && incident" class="resident-main">
-        <div class="page-head"><div><span class="eyebrow">Resident check-in · 報平安</span><h2 id="report-title" tabindex="-1">{{ reportStep === 'choice' ? 'Are you safe?' : reportStep === 'details' ? myReport.status === 'safe' ? 'You reported safe' : 'Your help request is saved' : myReport.status === 'safe' ? 'Remain in a safe area' : 'Please stay calm' }}</h2><p>{{ incident.name }} · Unit {{ user.username }}</p></div></div>
+        <div class="page-head"><div><span class="eyebrow">Resident check-in · 報平安</span><h2 id="report-title" tabindex="-1">{{ reportStep === 'choice' ? 'Are you safe?' : ['injuries', 'details'].includes(reportStep) ? myReport.status === 'safe' ? 'You reported safe' : 'Your help request is saved' : myReport.status === 'safe' ? 'Remain in a safe area' : 'Please stay calm' }}</h2><p>{{ incident.name }} · Unit {{ user.username }}</p></div></div>
         <div v-if="reportStep === 'choice'" class="status-choices" aria-label="Choose your safety status">
           <button class="status-choice safe-button" :disabled="busy" @click="chooseSafety('safe')"><CircleCheck :size="44"/><span>Safe</span></button>
           <button class="status-choice danger" :disabled="busy" @click="chooseSafety('help')"><TriangleAlert :size="44"/><span>I need help</span></button>
+        </div>
+        <div v-else-if="reportStep === 'injuries'" class="report-card help injury-step">
+          <p class="status-saved"><Check :size="18"/>Your help request is already saved and visible to responders.</p>
+          <h3>What injuries do you have?</h3><p id="injury-hint">Choose all that apply. Each tap saves immediately. You can also continue without choosing.</p>
+          <div class="injury-choices" role="group" aria-label="Injury types" aria-describedby="injury-hint"><button v-for="type in INJURY_TYPES" :key="type.id" class="injury-choice" :class="{ selected: selectedInjuries.includes(type.id) }" :aria-pressed="selectedInjuries.includes(type.id)" :aria-label="type.label" :disabled="busy" @click="toggleInjury(type.id)"><InjuryIcon :type="type.id"/><strong>{{ type.label }}</strong><small lang="zh-Hant">{{ type.chinese }}</small><span class="injury-description">{{ type.description }}</span><span class="injury-choice-state"><Check v-if="selectedInjuries.includes(type.id)" :size="16"/>{{ selectedInjuries.includes(type.id) ? 'Selected' : 'Tap to select' }}</span></button></div>
+          <p class="injury-save-state" role="status" aria-live="polite">{{ busy ? 'Saving…' : selectedInjuries.length ? `${selectedInjuries.length} injury type${selectedInjuries.length === 1 ? '' : 's'} saved · visible to responders` : 'No injury types selected. Your help request is still saved.' }}</p>
+          <button class="danger full" :disabled="busy" @click="continueInjuries">Continue<ArrowRight :size="18"/></button>
+          <a class="emergency-call injury-emergency-call" href="tel:999"><Phone :size="18"/>In an emergency, call 999</a>
         </div>
         <form v-else-if="reportStep === 'details'" class="report-card" :class="myReport.status" @submit.prevent="submitSafetyDetails">
           <p class="status-saved" role="status"><Check :size="18"/>Your {{ myReport.status === 'safe' ? 'safe status' : 'help request' }} is already saved and visible to responders.</p>
           <template v-if="myReport.status === 'safe'">
             <label class="field"><span>Family member’s WhatsApp phone number <small>(optional)</small></span><input v-model="safety.familyPhone" type="tel" maxlength="30" autocomplete="tel" placeholder="e.g. +852 9123 4567" :disabled="busy"></label>
-            <p class="hint">You can leave this blank. WhatsApp notifications will be enabled later.</p>
+            <p class="hint">{{ whatsapp.enabled ? 'Optional. Submit to ask the system to notify this family number. Hong Kong numbers can use 8 digits; include +country code for other countries.' : 'Optional. WhatsApp notifications are currently disabled.' }}</p>
           </template>
           <template v-else>
-            <p>You can leave every field blank and submit immediately.</p>
+            <div class="selected-injury-summary"><InjuryBadges v-if="selectedInjuries.length" :injuries="selectedInjuries" show-labels/><p v-else>No injury types selected.</p><button type="button" :disabled="busy" @click="changeInjuries">Change injury selection</button></div><p>You can leave every field blank and submit immediately.</p>
             <label class="field"><span>What is happening? <small>(optional)</small></span><textarea v-model="safety.situation" maxlength="1500" placeholder="Describe your situation if you can." :disabled="busy"></textarea></label>
             <label class="field"><span>Where are you now? <small>(optional)</small></span><input v-model="safety.location" maxlength="200" placeholder="e.g. Building A, third-floor stairwell" :disabled="busy"></label>
             <label class="field"><span>Your phone number <small>(optional)</small></span><input v-model="safety.contact" type="tel" maxlength="30" autocomplete="tel" placeholder="e.g. +852 9123 4567" :disabled="busy"></label>
@@ -303,13 +402,18 @@ onUnmounted(() => { clearInterval(timer); mapEvents?.close(); });
         </form>
         <div v-else class="report-confirmation" :class="myReport.status" role="status">
           <CircleCheck v-if="myReport.status === 'safe'" :size="52"/><TriangleAlert v-else :size="52"/>
-          <h3>{{ myReport.status === 'safe' ? 'Your safe report has been saved.' : 'Your request is visible to the rescue team.' }}</h3>
-          <p v-if="myReport.status === 'safe'">Please remain in a safe area.</p>
+          <h3>{{ myReport.status === 'safe' ? 'Your safe report has been saved.' : 'Your request is visible to the rescue team.' }}</h3><InjuryBadges v-if="selectedInjuries.length" :injuries="selectedInjuries" show-labels/>
+          <p v-if="myReport.status === 'safe'" class="notification-state" :data-notification-status="myReport.notificationStatus">{{ safeConfirmationText(myReport) }}</p>
           <p v-else>Please stay calm and wait for rescue assistance. Responders can contact you using any phone number you provided.</p>
           <a class="emergency-call" href="tel:999"><Phone :size="22"/>In an emergency, call 999</a>
           <small>Reported {{ formatTime(myReport.createdAt) }} (HKT)</small>
         </div>
       </section>
+
+      <WhatsAppInbox v-else-if="screen === 'inbox' && manager && incident"
+        :key="incident.incidentId" :api="api" :incident-id="incident.incidentId"
+        :superadmin="user.role === 'superadmin'" :format-time="formatTime"
+        @reconnect="reconnectFromInbox" @expired="expireInbox"/>
 
       <section v-else-if="screen === 'lost'" class="lost-main"><div class="page-head"><div><span class="eyebrow">Community belongings</span><h2>Lost & Found</h2><p>Find a belonging, or help return one to its owner.</p></div><PackageSearch class="page-icon" :size="44"/></div><div class="card"><h3>I lost something</h3><p>Search descriptions, locations, and categories.</p><form class="search-row" @submit.prevent="loadItems(true)"><label class="field"><span>Keywords</span><input v-model="keyword" maxlength="100" placeholder="e.g. Mickey Mouse toy" :disabled="busy"></label><button class="primary" :disabled="busy"><Search :size="17"/>Search</button></form><div class="deferred"><LockKeyhole :size="16"/><span>AI photo search will be added later. You can search by keywords now.</span></div><template v-if="searched"><p class="result-count">{{ items.length }} matching item{{ items.length===1?'':'s' }}</p><div v-if="!items.length" class="empty-state">No matches yet. Try different keywords or browse all items.</div><div class="item-list"><button v-for="entry in items" :key="entry._id" class="item-row" :disabled="busy" @click="openItem(entry._id)"><img :src="photoUrl(entry._id)" alt="Found item"><span><strong>{{ entry.description }}</strong><small>{{ entry.category }} · {{ entry.place }}</small></span><ArrowRight :size="18"/></button></div></template></div><div class="card found-callout"><div><span class="eyebrow">Help reunite an item</span><h3>I found something</h3><p>Post a photo and details so its owner can contact you.</p></div><div class="actions"><button class="primary" :disabled="busy" @click="newFound"><Upload :size="17"/>I Found Something</button><button :disabled="busy" @click="loadItems(false)">Show all items<ArrowRight :size="17"/></button></div></div></section>
 
@@ -320,7 +424,20 @@ onUnmounted(() => { clearInterval(timer); mapEvents?.close(); });
       <section v-else-if="screen === 'detail' && item" class="lost-main"><button class="back-link" :disabled="busy" @click="loadItems(false)"><ArrowLeft :size="17"/>Back to items</button><div class="card item-detail"><img :src="photoUrl(item._id)" alt="Photo of the found item"><div><span class="eyebrow">Found item · {{ item.category }}</span><h2>{{ item.description }}</h2><dl><dt><MapPin :size="16"/>Place found</dt><dd>{{ item.place }}</dd><dt><Phone :size="16"/>Finder contact</dt><dd>{{ item.contact }}</dd><dt>Reported by</dt><dd>{{ item.createdBy }}</dd><dt>Reported at</dt><dd>{{ formatTime(item.createdAt) }} (HKT)</dd></dl><p class="hint">Contact the finder and describe identifying details to arrange a return.</p></div></div></section>
       <div v-if="floorDraft && manager" class="map-modal-backdrop"><form class="card map-modal" role="dialog" aria-modal="true" :aria-label="`Floor ${floorDraft.floor} search status`" @submit.prevent="updateFloor(floorDraft)"><h3>{{ floorDraft.floor }} / F · Search status</h3><p v-if="error" class="message error" role="alert">{{ error }}</p><label class="field"><span>Search status</span><select aria-label="Search status" v-model="floorDraft.status" :disabled="busy"><option value="not_started">Not yet searched / reopen</option><option value="cleared">Cleared — search completed</option><option value="inaccessible">Inaccessible — cannot search</option></select></label><label class="field"><span>Floor note {{ floorDraft.status === 'inaccessible' ? '(required)' : '(optional)' }}</span><textarea v-model="floorDraft.note" aria-label="Floor note" maxlength="300" :required="floorDraft.status === 'inaccessible'" :disabled="busy" placeholder="e.g. Fire blocks the stairwell"></textarea></label><p class="hint">These changes update search progress only. Existing safe/help reports remain visible.</p><div class="actions"><button class="primary" :disabled="busy">Save floor status</button><button type="button" :disabled="busy" @click="floorDraft=null">Cancel</button><button type="button" :disabled="busy" @click="openFloor(floorDraft.floor)">Reload latest status</button></div></form></div>
     </main>
-    <nav v-if="user && incident" class="bottom-nav" aria-label="Main navigation"><button :disabled="busy" :aria-current="!lostScreen ? 'page' : undefined" :class="{ selected: !lostScreen }" @click="navigate(manager ? 'map' : 'resident')"><House :size="21"/>報平安 · Safety</button><button :disabled="busy" :aria-current="lostScreen ? 'page' : undefined" :class="{ selected: lostScreen }" @click="navigate('lost')"><Search :size="21"/>Lost & Found</button></nav>
+    <nav v-if="user && incident && incident.setupComplete !== false" class="bottom-nav" aria-label="Main navigation">
+      <button :disabled="busy" :aria-current="!lostScreen && !inboxScreen ? 'page' : undefined"
+        :class="{ selected: !lostScreen && !inboxScreen }" @click="navigate(manager ? 'map' : 'resident')">
+        <House :size="21"/>報平安 · Safety
+      </button>
+      <button :disabled="busy" :aria-current="lostScreen ? 'page' : undefined"
+        :class="{ selected: lostScreen }" @click="navigate('lost')">
+        <Search :size="21"/>Lost & Found
+      </button>
+      <button v-if="manager" :disabled="busy" :aria-current="inboxScreen ? 'page' : undefined"
+        :class="{ selected: inboxScreen }" @click="navigate('inbox')">
+        <Mail :size="21" aria-hidden="true"/>WhatsApp Inbox
+      </button>
+    </nav>
     </div>
     <footer>Auto Safety Report · Final Year Project · Localhost testing</footer>
   </div>

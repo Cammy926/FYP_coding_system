@@ -6,15 +6,24 @@ import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import sharp from 'sharp';
 import { ApiError, text, phone, hashPassword, verifyPassword, publicUser, mutationQueue } from './lib.js';
 import { blockUnitName } from '../shared/blocks.js';
+import { INJURY_TYPES, emptyInjuryCounts, reportInjuries } from '../shared/injuries.js';
 import { deleteIncidentData } from './db.js';
 import { createSessionStore } from './sessions.js';
+import { createNotifications, familyPhone } from './notifications.js';
+import { createWhatsAppInbox, inboxHistoryLimit } from './whatsapp-inbox.js';
+import { legacyWhatsAppClientId } from './whatsapp.js';
 import { mapProjection, incidentBlocks, pngImage, validateMap, assertSameLayout, requireMarkers } from './maps.js';
 
 const SESSION = 'safety_session';
 const digest = token => createHash('sha256').update(token).digest('hex');
 const categories = ['Toys', 'Documents', 'Electronics', 'Clothing', 'Other'];
 const withoutPhoto = { projection: { photo: 0 } };
-export function createApp(db, { origins = ['http://localhost:5173', 'http://127.0.0.1:5173'], rateLimits = true } = {}) {
+function publicReport(report) {
+  if (!report) return report;
+  const { notificationSenderKey, ...visible } = report;
+  return visible;
+}
+export function createApp(db, { origins = ['http://localhost:5173', 'http://127.0.0.1:5173'], rateLimits = true, whatsapp, notificationOptions = {}, defaultCountryCode = '852' } = {}) {
   const app = express();
   const mutate = mutationQueue();
   const sessions = createSessionStore();
@@ -25,6 +34,27 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
       client.res.write(`event: ${event}\ndata: {}\n\n`);
     }
   };
+  const notifications = createNotifications(db, { ...notificationOptions, transport: whatsapp, exclusive: mutate, publish: () => publishMap('reports') });
+  app.locals.notifications = notifications;
+  const senderId = incident => incident.whatsappClientId || legacyWhatsAppClientId;
+  async function completeWhatsAppSetup() {
+    await mutate(async () => {
+      const incident = await db.collection('incidents').findOne({ _id: 'current', status: 'active', setupComplete: false });
+      if (!incident || whatsapp?.status().state !== 'ready' || whatsapp.binding() !== senderId(incident)) return;
+      await db.collection('incidents').updateOne({ _id: 'current', incidentId: incident.incidentId, setupComplete: false }, { $set: { setupComplete: true, setupCompletedAt: new Date(), whatsappLinkedAt: new Date() } });
+      publishMap('setup');
+    });
+  }
+  const unwatchWhatsApp = whatsapp?.onChange(() => {
+    publishMap('whatsapp');
+    if (whatsapp.status().state === 'ready') void completeWhatsAppSetup().catch(() => console.error('Could not finalize WhatsApp setup. Reload the setup page to retry.'));
+  });
+  const connectWhatsApp = incident => whatsapp.start({ clientId: senderId(incident) });
+  app.locals.restoreWhatsApp = async () => {
+    const incident = await db.collection('incidents').findOne({ _id: 'current', status: 'active' });
+    if (notifications.enabled && incident && incident.setupComplete !== false) await connectWhatsApp(incident);
+  };
+  app.locals.closeStreams = () => { unwatchWhatsApp?.();for (const client of mapClients) client.res.end(); };
   app.disable('x-powered-by');
   app.use(helmet());
   app.use((req, res, next) => {
@@ -51,7 +81,7 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
   const initialized = async () => {
     const incident = await db.collection('incidents').findOne({ _id: 'current' });
     const map = await db.collection('disaster_maps').findOne({ _id: 'current' }, { projection: { phase: 1, incidentId: 1 } });
-    return incident?.status === 'active' && map?.phase === 'active' && map.incidentId === incident.incidentId;
+    return incident?.status === 'active' && incident.setupComplete !== false && map?.phase === 'active' && map.incidentId === incident.incidentId;
   };
   const auth = async (req, res, next) => {
     try {
@@ -76,9 +106,35 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
     if (req.user.role === 'user' && req.user.incidentId !== incident.incidentId) throw new ApiError(401, 'Your disaster setup has been cleared.');
     return incident;
   };
+  const inbox = createWhatsAppInbox(db, { transport: whatsapp, senderId, exclusive: mutate, authorize: stillAuthorized });
+  app.locals.drainWhatsAppReplies = inbox.pauseAndDrain;
+  const inboxIncident = async (req, incidentId) => {
+    const incident = await stillAuthorized(req);
+    if (incident.incidentId !== incidentId || incident.setupComplete === false) {
+      throw new ApiError(409, 'Open the WhatsApp inbox for the current disaster.');
+    }
+    return incident;
+  };
+  app.get('/api/whatsapp/chats', auth, role('admin', 'superadmin'), async (req, res) => {
+    const incident = await inboxIncident(req, req.query.incidentId);
+    const result = await inbox.list(incident);
+    await inboxIncident(req, incident.incidentId);
+    res.json(result);
+  });
+  app.get('/api/whatsapp/chats/:phone', auth, role('admin', 'superadmin'), async (req, res) => {
+    const incident = await inboxIncident(req, req.query.incidentId);
+    const result = await inbox.conversation(incident, req.params.phone, inboxHistoryLimit(req.query.limit), req.user.role === 'superadmin');
+    await inboxIncident(req, incident.incidentId);
+    res.json(result);
+  });
+  app.post('/api/whatsapp/chats/:phone/reply', auth, role('admin', 'superadmin'), async (req, res) => {
+    const incident = await inboxIncident(req, req.body.incidentId);
+    await inbox.reply(req, incident, req.params.phone);
+    res.status(201).json({ sent: true });
+  });
   app.get('/api/health', async (req, res) => {
     await db.command({ ping: 1 });
-    res.json({ status: 'ok', database: db.databaseName, collections: db.collectionNames, features: { whatsapp: false, photoSearch: false } });
+    res.json({ status: 'ok', database: db.databaseName, collections: db.collectionNames, features: { whatsapp: notifications.enabled, photoSearch: false }, whatsapp: notifications.status() });
   });
   app.post('/api/auth/login', loginLimit, async (req, res) => {
     const username = text(req.body.username, 'Account name', 40);
@@ -88,7 +144,7 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
     const token = randomBytes(32).toString('hex');
     const expiresAt = new Date(Date.now() + 8 * 60 * 60 * 1000);
     await mutate(async () => {
-      if (user.role !== 'superadmin' && !await initialized()) throw new ApiError(403, 'Only Super Admin can sign in until the disaster map is initialized.');
+      if (user.role !== 'superadmin' && !await initialized()) throw new ApiError(403, 'Only Super Admin can sign in until the disaster map and WhatsApp setup are complete.');
       if (user.role === 'user' && user.incidentId !== (await active()).incidentId) throw new ApiError(401, 'This unit account is no longer active.');
       sessions.create({ _id: digest(token), userId: user._id, ...(user.incidentId ? { incidentId: user.incidentId } : {}), expiresAt, createdAt: new Date() });
     });
@@ -101,11 +157,42 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
     res.json({ message: 'Logged out.' });
   });
   app.get('/api/auth/me', auth, (req, res) => res.json({ user: publicUser(req.user) }));
+  app.get('/api/whatsapp', auth, role('superadmin'), async (req, res) => {
+    await completeWhatsAppSetup();
+    const incident = await active();
+    const matchingSender = whatsapp?.binding() === senderId(incident);
+    const connection = whatsapp?.setupStatus();
+    res.json({ ...connection, ...(!matchingSender && notifications.enabled ? { state: ['error', 'disconnected', 'auth_failure'].includes(connection.state) ? connection.state : 'idle', qrAvailable: false } : {}), enabled: notifications.enabled, incidentId: incident.incidentId, setupComplete: incident.setupComplete !== false });
+  });
+  app.post('/api/whatsapp/connect', auth, role('superadmin'), async (req, res) => {
+    if (!notifications.enabled) throw new ApiError(409, 'WhatsApp is disabled in the backend configuration.');
+    const incident = await mutate(async () => {
+      const current = await stillAuthorized(req);
+      if (req.body.incidentId !== current.incidentId) throw new ApiError(409, 'This setup belongs to a previous disaster. Reload the current setup.');
+      await connectWhatsApp(current);
+      return current;
+    });
+    // Starting is serialized before returning; Chromium/QR loading continues in
+    // the background so the setup page can render while the sender logs in.
+    res.status(202).json({ ...whatsapp.setupStatus(), incidentId: incident.incidentId });
+  });
+  app.get('/api/whatsapp/qr', auth, role('superadmin'), async (req, res) => {
+    const incident = await active();
+    if (req.query.incidentId !== incident.incidentId) throw new ApiError(409, 'Reload the QR for the current disaster.');
+    if (whatsapp?.binding() !== senderId(incident)) throw new ApiError(409, 'Start the connection for this disaster first.');
+    const image = whatsapp.qr();
+    if (!image) throw new ApiError(404, 'The QR is loading or has already been scanned.');
+    res.type('image/png').send(image);
+  });
   app.get('/api/incident', auth, async (req, res) => {
     const incident = await db.collection('incidents').findOne({ _id: 'current' });
     if (incident && incident.status !== 'active') throw new ApiError(503, 'Setup or clearing is in progress. Please wait or restart the backend.');
     const map = incident ? await db.collection('disaster_maps').findOne({ _id: 'current', phase: 'active', incidentId: incident.incidentId }, { projection: { name: 1, blocks: 1 } }) : null;
-    res.json({ incident: map ? { ...incident, name: map.name, blocks: map.blocks } : incident });
+    const response = { incident: map ? { ...incident, name: map.name, blocks: map.blocks } : incident };
+    if (req.user.role === 'superadmin' && incident && whatsapp?.binding() === senderId(incident)) {
+      response.whatsappSenderNumber = whatsapp.senderNumber?.() ?? null;
+    }
+    res.json(response);
   });
   app.get('/api/map', auth, role('admin', 'superadmin'), async (req, res) => {
     res.json({ map: await db.collection('disaster_maps').findOne({ _id: 'current' }, mapProjection) });
@@ -172,11 +259,15 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
         assertSameLayout(map.blocks, existing);
         const result = await db.collection('disaster_maps').updateOne({ _id: 'current', revision: map.revision }, { $set: { phase: 'active', incidentId: existing.incidentId, updatedAt: new Date() }, $inc: { revision: 1 } });
         if (result.matchedCount !== 1) throw new ApiError(409, 'The map changed. Reload the saved map.');
-        return { incident: existing, count: await db.collection('users').countDocuments({ incidentId: existing.incidentId }), preserved: true };
+        const setupComplete = !notifications.enabled;
+        await db.collection('incidents').updateOne({ _id: 'current', incidentId: existing.incidentId }, { $set: { setupComplete } });
+        if (!setupComplete) await connectWhatsApp(existing);
+        return { incident: { ...existing, setupComplete }, count: await db.collection('users').countDocuments({ incidentId: existing.incidentId }), preserved: true };
       }
       // Validate again so a draft saved by an older backend gets named prefixes too.
       map.blocks = validateMap(map).blocks;
-      const incident = { _id: 'current', incidentId: randomUUID(), name: map.name, buildings: map.blocks.length, blocks: map.blocks, blockIdentityVersion: 1, floors: map.blocks[0].floors, rooms: map.blocks[0].rooms, status: 'provisioning', createdAt: new Date(), createdBy: req.user.username };
+      const incidentId = randomUUID();
+      const incident = { _id: 'current', incidentId, setupComplete: !notifications.enabled, ...(notifications.enabled ? { whatsappClientId: 'auto-safety-report-' + incidentId } : {}), name: map.name, buildings: map.blocks.length, blocks: map.blocks, blockIdentityVersion: 1, floors: map.blocks[0].floors, rooms: map.blocks[0].rooms, status: 'provisioning', createdAt: new Date(), createdBy: req.user.username };
       await db.collection('incidents').insertOne(incident);
       try {
         const accounts = [];
@@ -192,6 +283,7 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
         const saved = await db.collection('disaster_maps').updateOne({ _id: 'current', revision: map.revision }, { $set: { phase: 'active', incidentId: incident.incidentId, blocks: map.blocks, updatedAt: new Date() }, $inc: { revision: 1 } });
         if (saved.matchedCount !== 1) throw new ApiError(409, 'The map changed. Reload the saved map.');
         await db.collection('incidents').updateOne({ _id: 'current', incidentId: incident.incidentId }, { $set: { status: 'active' } });
+        if (!incident.setupComplete) await connectWhatsApp(incident);
         return { incident: { ...incident, status: 'active' }, count: accounts.length, preserved: false };
       } catch (e) {
         await db.collection('disaster_maps').updateOne({ _id: 'current', incidentId: incident.incidentId }, { $set: { phase: 'draft', incidentId: null } });
@@ -202,14 +294,24 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
   });
   app.delete('/api/incident', auth, role('superadmin'), async (req, res) => {
     if (req.body.confirmation !== 'CLEAR') throw new ApiError(400, 'Type CLEAR to confirm deletion.');
-    await mutate(async () => {
+    const [resumeNotifications, resumeReplies] = await Promise.all([
+      notifications.pauseAndDrain(), inbox.pauseAndDrain(),
+    ]);
+    try { await mutate(async () => {
       if (!sessions.get(req.sessionId)) throw new ApiError(401, 'Please log in again.');
       const incident = await db.collection('incidents').findOne({ _id: 'current' });
       if (!incident) throw new ApiError(409, 'No disaster is configured.');
+      // Confirm remote logout before marking clearing. If it fails, all
+      // disaster data stays available for another attempt. Recovery after this
+      // point can safely finish deletion because the sender was logged out.
+      if (whatsapp) {
+        try { await whatsapp.logout({ clientId: senderId(incident) }); }
+        catch { throw new ApiError(503, 'WhatsApp logout could not be confirmed. Your disaster data is preserved. Reconnect WhatsApp and retry Clear Setup.'); }
+      }
       await db.collection('incidents').updateOne({ _id: 'current' }, { $set: { status: 'clearing' } });
       await deleteIncidentData(db, incident);
       sessions.deleteIncident(incident.incidentId);
-    });
+    }); } finally { resumeNotifications(); resumeReplies(); }
     publishMap();
     res.json({ message: 'Disaster data, unit accounts, safety reports, and found items deleted. Manager accounts remain.' });
   });
@@ -219,7 +321,7 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
     res.json({ accounts: users });
   });
   app.get('/api/reports/mine', auth, role('user'), async (req, res) => {
-    res.json({ report: await db.collection('safety_reports').findOne({ _id: `${req.user.incidentId}:${req.user._id}` }) });
+    res.json({ report: publicReport(await db.collection('safety_reports').findOne({ _id: `${req.user.incidentId}:${req.user._id}` })) });
   });
   // Save the button press before asking for optional details.
   app.post('/api/reports', auth, role('user'), async (req, res) => {
@@ -233,21 +335,44 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
         if (existing.status !== status) throw new ApiError(409, 'This unit has already chosen a status. You can finish its optional details.');
         return { report: existing, created: false };
       }
-      const report = { _id: id, incidentId: incident.incidentId, userId: req.user._id, username: req.user.username, building: req.user.building, floor: req.user.floor, room: req.user.room, status, familyPhone: '', situation: '', location: '', contact: '', detailsSubmittedAt: null, notificationStatus: 'disabled', createdAt: new Date() };
+      const report = { _id: id, incidentId: incident.incidentId, userId: req.user._id, username: req.user.username, building: req.user.building, floor: req.user.floor, room: req.user.room, status, familyPhone: '', situation: '', location: '', contact: '', injuries: [], injuryStepCompletedAt: null, revision: 1, detailsSubmittedAt: null, notificationStatus: notifications.enabled ? status === 'safe' ? 'not_requested' : 'not_applicable' : 'disabled', createdAt: new Date() };
       await db.collection('safety_reports').insertOne(report);
       return { report, created: true };
     });
-    res.status(result.created ? 201 : 200).json({ report: result.report });
+    if (result.created) publishMap('reports');
+    res.status(result.created ? 201 : 200).json({ report: publicReport(result.report) });
+  });
+  app.patch('/api/reports/mine/injuries', auth, role('user'), async (req, res) => {
+    const completeStep = req.body.completeStep === true;
+    if (completeStep ? ('injury' in req.body || 'selected' in req.body) : (!INJURY_TYPES.some(type => type.id === req.body.injury) || typeof req.body.selected !== 'boolean')) throw new ApiError(400, 'Choose a valid injury and whether it is selected, or continue to the optional details.');
+    const report = await mutate(async () => {
+      const incident = await stillAuthorized(req);
+      const id = `${incident.incidentId}:${req.user._id}`;
+      const existing = await db.collection('safety_reports').findOne({ _id: id });
+      if (!existing || existing.status !== 'help') throw new ApiError(409, 'Choose I need help before selecting injuries.');
+      if (existing.detailsSubmittedAt !== null) throw new ApiError(409, 'This report has already been submitted.');
+      const injuries = reportInjuries(existing);
+      if (completeStep && existing.injuryStepCompletedAt) return existing;
+      if (!completeStep && injuries.includes(req.body.injury) === req.body.selected) return existing;
+      const update = completeStep
+        ? { $set: { injuryStepCompletedAt: new Date() }, $inc: { revision: 1 } }
+        : { [req.body.selected ? '$addToSet' : '$pull']: { injuries: req.body.injury }, $inc: { revision: 1 } };
+      const saved = await db.collection('safety_reports').updateOne({ _id: id, detailsSubmittedAt: null }, update);
+      if (saved.matchedCount !== 1) throw new ApiError(409, 'This report changed. Please reload.');
+      return db.collection('safety_reports').findOne({ _id: id });
+    });
+    publishMap('reports');res.json({ report: publicReport(report) });
   });
   app.patch('/api/reports/mine', auth, role('user'), async (req, res) => {
     if ('status' in req.body) throw new ApiError(400, 'The chosen status cannot be changed.');
+    if ('injuries' in req.body) throw new ApiError(400, 'Use the injury selection buttons to update injuries.');
     const report = await mutate(async () => {
       const incident = await stillAuthorized(req);
       const id = `${incident.incidentId}:${req.user._id}`;
       const existing = await db.collection('safety_reports').findOne({ _id: id });
       if (!existing) throw new ApiError(409, 'Choose Safe or I need help first.');
       const details = existing.status === 'safe'
-        ? { familyPhone: phone(req.body.familyPhone, 'Family phone number', true), situation: '', location: '', contact: '' }
+        ? { familyPhone: notifications.enabled ? familyPhone(req.body.familyPhone, defaultCountryCode) : phone(req.body.familyPhone, 'Family phone number', true), situation: '', location: '', contact: '' }
         : { familyPhone: '', situation: text(req.body.situation, 'Current situation', 1500, true), location: text(req.body.location, 'Current location', 200, true), contact: phone(req.body.contact, 'Your phone number', true) };
       if (existing.detailsSubmittedAt !== null) {
         // Legacy completed reports remain locked. Identical retries of a new
@@ -256,11 +381,13 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
         throw new ApiError(409, 'The optional details have already been submitted.');
       }
       const detailsSubmittedAt = new Date();
-      const result = await db.collection('safety_reports').updateOne({ _id: id, detailsSubmittedAt: null }, { $set: { ...details, detailsSubmittedAt } });
+      const map = await db.collection('disaster_maps').findOne({ _id: 'current', incidentId: incident.incidentId }, { projection: { name: 1 } });
+      const notificationFields = notifications.fieldsFor(existing, details, map?.name || incident.name);
+      const result = await db.collection('safety_reports').updateOne({ _id: id, detailsSubmittedAt: null }, { $set: { ...details, ...notificationFields, detailsSubmittedAt }, $inc: { revision: 1 } });
       if (result.matchedCount !== 1) throw new ApiError(409, 'This report is no longer available for details. Please reload.');
-      return { ...existing, ...details, detailsSubmittedAt };
+      return { ...existing, ...details, ...notificationFields, detailsSubmittedAt, revision: (existing.revision || 0) + 1 };
     });
-    res.json({ report });
+    publishMap('reports');void notifications.kick();res.json({ report: publicReport(report) });
   });
   app.patch('/api/floors/:building/:floor', auth, role('admin', 'superadmin'), async (req, res) => {
     const building = Number(req.params.building), floor = Number(req.params.floor);
@@ -272,6 +399,7 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
     if (status === 'inaccessible' && !note) throw new ApiError(400, 'Add a short reason why this floor cannot be searched.');
     const result = await mutate(async () => {
       const incident = await stillAuthorized(req);
+      if (incident.setupComplete === false) throw new ApiError(409, 'Finish the Super Admin WhatsApp setup first.');
       if (incident.incidentId !== expectedIncident) throw new ApiError(409, 'This floor belongs to a previous disaster. Reload the current setup.');
       const map = await db.collection('disaster_maps').findOne({ _id: 'current' }, mapProjection);
       if (map?.phase !== 'active' || map.incidentId !== incident.incidentId) throw new ApiError(409, 'Initialize the disaster map first.');
@@ -296,6 +424,7 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
   });
   app.get('/api/dashboard', auth, role('admin', 'superadmin'), async (req, res) => {
     const incident = await active();
+    if (incident.setupComplete === false) throw new ApiError(409, 'Finish the Super Admin WhatsApp setup first.');
     const map = await db.collection('disaster_maps').findOne({ _id: 'current' }, mapProjection);
     if (map?.phase !== 'active' || map.incidentId !== incident.incidentId) throw new ApiError(409, 'Initialize the disaster map first.');
     const blocks = map.blocks;
@@ -306,11 +435,13 @@ export function createApp(db, { origins = ['http://localhost:5173', 'http://127.
     }
     const reports = await db.collection('safety_reports').find({ incidentId: incident.incidentId, ...(selected === null ? {} : { building: selected }) }).toArray();
     const safe = reports.filter(r => r.status === 'safe').length, help = reports.filter(r => r.status === 'help').length;
+    const injuryCounts = emptyInjuryCounts();
+    for (const report of reports) for (const injury of reportInjuries(report)) injuryCounts[injury]++;
     const total = blocks.filter(b => selected === null || b.building === selected).reduce((n, b) => n + b.floors * b.rooms, 0);
     const floorSearches = (await db.collection('floor_searches').find({ incidentId: incident.incidentId, ...(selected === null ? {} : { building: selected }) }).toArray()).filter(record => blocks[record.building] && Number.isInteger(record.floor) && record.floor >= 1 && record.floor <= blocks[record.building].floors && ['not_started', 'cleared', 'inaccessible'].includes(record.status));
     const floorTotal = blocks.filter(b => selected === null || b.building === selected).reduce((n, b) => n + b.floors, 0);
     const cleared = floorSearches.filter(f => f.status === 'cleared').length, inaccessible = floorSearches.filter(f => f.status === 'inaccessible').length;
-    res.json({ incident: { ...incident, name: map.name, blocks }, reports, building: selected, counts: { safe, help, none: total - safe - help }, floorSearches, searchProgress: { cleared, inaccessible, pending: floorTotal - cleared - inaccessible, total: floorTotal } });
+    res.json({ incident: { ...incident, name: map.name, blocks }, reports: reports.map(publicReport), building: selected, counts: { safe, help, none: total - safe - help }, injuryCounts, floorSearches, searchProgress: { cleared, inaccessible, pending: floorTotal - cleared - inaccessible, total: floorTotal } });
   });
   app.get('/api/items', auth, async (req, res) => {
     const incident = await active();
